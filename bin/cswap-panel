@@ -1272,7 +1272,9 @@ def cmd_run(args) -> int:
   # the handler below stops the whole group.
   shell_pid = os.getppid()
   zero = ctypes.c_ulong(0)
-  prctl(PR_SET_PDEATHSIG, ctypes.c_ulong(signal.SIGTERM), zero, zero, zero)
+  if prctl(PR_SET_PDEATHSIG, ctypes.c_ulong(signal.SIGTERM), zero, zero, zero) != 0:
+    log(f"run: prctl failed: {os.strerror(ctypes.get_errno())}")
+    return EXIT_RUNNER
   if os.getppid() != shell_pid:
     log("run: the shell ended before the command started")
     return EXIT_RUNNER

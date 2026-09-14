@@ -87,7 +87,8 @@ Item {
     panelScript: root.panelScript
     environment: root.closedEnv
     timeoutSec: 15
-    // The reader writes at most 2 MiB of records and 128 KiB of status.
+    // The reader keeps at most 2 MiB of records and 64 KiB for each status
+    // file. Its JSON output can be a little larger; this cap leaves room.
     maxOut: 2621440
     maxErr: 65536
     onDone: (ok, exitCode, output) => {

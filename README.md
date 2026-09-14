@@ -102,7 +102,7 @@ The plugin reads the usage of all accounts every 180 seconds. To change the inte
 - The bridge writes the files through the same folder checks. It writes a new file first, then renames it.
 - The usage update is the unchanged Omarchy command `/usr/bin/omarchy-agent-usage-update`.
 - Before the plugin runs `cswap` or `claude`, `bin/cswap-panel` checks the program. It follows each symlink itself, at most 8. Each folder on the way, from `/` down, must be owned by root or the user and not writable by group or others. The program must be a regular file with the same owner and write rules. `claude` must be an ELF program. A `cswap` script must have an absolute `#!` interpreter that is not `env`, and the interpreter must pass the same checks and be an ELF program. If a candidate fails, the plugin writes the reason and tries the next candidate.
-- The program then starts through the file descriptor that passed the checks, not through its name. A script starts through the descriptor of its checked interpreter, and the interpreter reads the script from a descriptor. Thus the program that runs is the file that passed the checks.
+- The program then starts through the file descriptor that passed the checks, not through its name. A script starts through the descriptor of its checked interpreter, and the interpreter reads the script from a descriptor. Thus the program that runs is the file that passed the checks. The Python modules that `cswap` imports still come from its own install folder in the home folder. Only the user and root can write that folder.
 - The usage update always skips the Codex collector, and `bin/cswap-panel state` ignores the Codex record.
 
 ## Update and remove
