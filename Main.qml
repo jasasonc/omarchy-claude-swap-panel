@@ -4,68 +4,138 @@ import Quickshell.Io
 
 // The display side of agent usage. All extraction lives behind
 // omarchy-agent-usage-update, which writes one JSON record per agent into
-// the usage directory; this file only discovers those records, watches them
-// for changes, and optionally merges snapshots synced from other machines.
+// the usage directory, and bin/cswap-panel bridge, which adds one record per
+// claude-swap account. This file never reads those files itself:
+// `cswap-panel state` reads them without following symlinks and with size
+// limits, and prints one JSON object.
+//
+// Every process starts through `cswap-panel run` (see LimitedProcess.qml),
+// with a fixed absolute program path and a closed environment.
 Item {
   id: root
   visible: false
 
   property var settings: ({})
 
-  readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/usage"
+  // ------------------------------------------------------ closed environment
 
-  // PATH with the standard system directories first, then the inherited PATH.
-  // The processes this plugin starts use it so a program placed in a
-  // user-writable directory earlier on PATH cannot stand in for a system
-  // tool such as sed or notify-send. The inherited PATH still follows, so
-  // cswap in ~/.local/bin and the Omarchy tools are still found.
-  readonly property string hardenedPath: "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (Quickshell.env("PATH") || "")
-
-  // claude-swap: the account Claude Code uses now, written by cswap-omarchy.
-  // The built-in Claude Code tab is named after it.
-  readonly property string cswapActivePath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/cswap-omarchy/active.json"
-  property var cswapActive: null
-
-  FileView {
-    path: root.cswapActivePath
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: {
-      try {
-        var parsed = JSON.parse(String(text() || ""))
-        root.cswapActive = parsed && typeof parsed === "object" ? parsed : null
-      } catch (e) {
-        root.cswapActive = null
-      }
+  // Only these variables reach a process. A value that is not in a safe form
+  // is left out, never set to null: for a null value Quickshell passes the
+  // inherited value.
+  readonly property var closedEnv: {
+    var env = { "PATH": "/usr/bin:/bin", "OMARCHY_PATH": "/usr/share/omarchy", "LANG": "C.UTF-8" }
+    var optional = {
+      "HOME": absolutePath(Quickshell.env("HOME")),
+      "XDG_RUNTIME_DIR": absolutePath(Quickshell.env("XDG_RUNTIME_DIR")),
+      "WAYLAND_DISPLAY": plainToken(Quickshell.env("WAYLAND_DISPLAY")),
+      "CLAUDE_CONFIG_DIR": absolutePath(Quickshell.env("CLAUDE_CONFIG_DIR")),
+      "CODEX_HOME": absolutePath(Quickshell.env("CODEX_HOME"))
     }
-    onLoadFailed: root.cswapActive = null
+    for (var key in optional) {
+      if (optional[key] !== "") env[key] = optional[key]
+    }
+    return env
   }
 
-  // Setup state from cswap-omarchy ("ok", "missing", "no-accounts" or "error")
-  // and the cswap binary it found. The file also changes when account tabs
-  // come or go, also after a run from bin/cswap-add-account, so a change rescans.
-  readonly property string cswapStatusPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/cswap-omarchy/status.json"
+  readonly property string home: closedEnv.HOME || ""
+
+  function envText(value) {
+    return value === null || value === undefined ? "" : String(value)
+  }
+
+  function absolutePath(value) {
+    var text = envText(value)
+    if (!/^\/[^\x00-\x1f\x7f]*$/.test(text)) return ""
+    return /(^|\/)\.\.(\/|$)/.test(text) ? "" : text
+  }
+
+  function plainToken(value) {
+    var text = envText(value)
+    return /^[A-Za-z0-9._-]{1,64}$/.test(text) ? text : ""
+  }
+
+  // A record id, as `cswap-panel state` accepts it. Only such ids go on a
+  // command line, so none can pass for an option.
+  function validId(id) {
+    return /^[a-z0-9][a-z0-9-]{0,79}$/.test(String(id))
+  }
+
+  function isObject(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+  }
+
+  readonly property string panelScript: decodeURIComponent(String(Qt.resolvedUrl("bin/cswap-panel")).replace(/^file:\/\//, ""))
+  readonly property var panelCommand: ["/usr/bin/python3", "-I", "-B", root.panelScript]
+
+  // ------------------------------------------------------------------ state
+
+  // claude-swap: the account Claude Code uses now. The built-in Claude Code
+  // tab is named after it.
+  property var cswapActive: null
+
+  // Setup state from the bridge ("ok", "missing", "no-accounts" or "error").
   property var cswapStatus: ({})
   readonly property string cswapState: String(cswapStatus.state || "")
-  readonly property string cswapPath: String(cswapStatus.cswapPath || "")
 
+  property var agentIds: []
+  property var agents: []
+  property int dataRevision: 0
+  property bool statePending: false
+
+  LimitedProcess {
+    id: stateRun
+    label: "cswap-panel state"
+    panelScript: root.panelScript
+    environment: root.closedEnv
+    timeoutSec: 15
+    maxOut: 4194304
+    maxErr: 65536
+    onDone: (ok, exitCode, output) => {
+      // A failed read keeps the last good state.
+      if (ok) root.applyState(output)
+      if (root.statePending) {
+        root.statePending = false
+        root.readState()
+      }
+    }
+  }
+
+  function readState() {
+    if (stateRun.running) root.statePending = true
+    else stateRun.start(root.panelCommand.concat(["state"]))
+  }
+
+  function applyState(output) {
+    var parsed
+    try {
+      parsed = JSON.parse(output)
+    } catch (e) {
+      console.warn("agents", "cswap-panel state: output is not JSON", e)
+      return
+    }
+    if (!isObject(parsed)) return
+
+    cswapStatus = isObject(parsed.status) ? parsed.status : ({})
+    cswapActive = isObject(parsed.active) && parsed.active.name ? parsed.active : null
+
+    var records = isObject(parsed.records) ? parsed.records : ({})
+    var ids = Object.keys(records).filter(function(id) { return root.validId(id) && root.isObject(records[id]) }).sort()
+    var list = []
+    for (var i = 0; i < ids.length; i++) list.push({ agentId: ids[i], record: records[ids[i]] })
+    agentIds = ids
+    agents = list
+    recordsChanged()
+  }
+
+  // The bridge writes status.json, also from the Add account terminal. A
+  // change reads the state again. This view only watches: preload is off and
+  // the content is never read here.
   FileView {
-    path: root.cswapStatusPath
+    path: root.home !== "" ? root.home + "/.local/state/cswap-omarchy/status.json" : ""
+    preload: false
     watchChanges: true
     printErrors: false
-    onFileChanged: reload()
-    onLoaded: {
-      try {
-        var parsed = JSON.parse(String(text() || ""))
-        root.cswapStatus = parsed && typeof parsed === "object" ? parsed : ({})
-      } catch (e) {
-        root.cswapStatus = ({})
-      }
-      root.rescanAgents()
-    }
-    onLoadFailed: root.cswapStatus = ({})
+    onFileChanged: root.readState()
   }
 
   // Tab name, slot number and email of the claude-swap account behind a record.
@@ -80,51 +150,33 @@ Item {
     return { name: "", number: 0, active: false, email: "" }
   }
 
-  // bin/cswap-omarchy writes the claude-swap records and active.json. It runs
-  // at start, on the claude-swap refresh interval, on each refresh, and after a switch.
-  readonly property string cswapBridge: decodeURIComponent(String(Qt.resolvedUrl("bin/cswap-omarchy")).replace(/^file:\/\//, ""))
+  // ----------------------------------------------------------------- bridge
+
+  // `cswap-panel bridge` writes the claude-swap records and active.json. It
+  // runs at start, on the claude-swap refresh interval, on each refresh, and
+  // after a switch.
   property bool cswapBridgePending: false
 
-  Process {
-    id: cswapBridgeProcess
-    running: false
-    command: ["python3", root.cswapBridge]
-    environment: ({ "PATH": root.hardenedPath })
-    onExited: {
-      cswapBridgeDeadline.stop()
-      // A new account file only shows up after a rescan of the usage folder.
-      root.rescanAgents()
+  LimitedProcess {
+    id: bridgeRun
+    label: "cswap-panel bridge"
+    panelScript: root.panelScript
+    environment: root.closedEnv
+    timeoutSec: 150
+    maxOut: 65536
+    maxErr: 65536
+    onDone: (ok, exitCode, output) => {
+      root.readState()
       if (root.cswapBridgePending) {
         root.cswapBridgePending = false
-        running = true
-        cswapBridgeDeadline.restart()
+        root.runCswapBridge()
       }
-    }
-
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (text.trim() !== "") console.warn("agents", "cswap-omarchy:", text.trim())
-    }
-  }
-
-  // A stuck cswap-omarchy run should not sit forever. Its own cswap call has
-  // a 120 s limit, so this only fires if the process hangs somewhere else.
-  Timer {
-    id: cswapBridgeDeadline
-    interval: 150000
-    repeat: false
-    onTriggered: {
-      console.warn("agents", "cswap-omarchy timed out; stopping it")
-      cswapBridgeProcess.running = false
     }
   }
 
   function runCswapBridge() {
-    if (cswapBridgeProcess.running) root.cswapBridgePending = true
-    else {
-      cswapBridgeProcess.running = true
-      cswapBridgeDeadline.restart()
-    }
+    if (bridgeRun.running) root.cswapBridgePending = true
+    else bridgeRun.start(root.panelCommand.concat(["bridge"]))
   }
 
   property int cswapRefreshIntervalSec: Math.min(3600, Math.max(60, Number(setting("cswapRefreshIntervalSec", 180))))
@@ -137,69 +189,9 @@ Item {
     onTriggered: root.runCswapBridge()
   }
 
-  // ------------------------------------------------------------- discovery
-
-  property var agentIds: []
-  property var agents: []
-  property int dataRevision: 0
-
-  Process {
-    id: listProcess
-    running: false
-    command: ["find", root.usageDir, "-maxdepth", "1", "-name", "*.json", "-printf", "%f\n"]
-
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyAgentListing(text)
-    }
-  }
-
-  function rescanAgents() {
-    if (!listProcess.running) listProcess.running = true
-  }
-
-  function applyAgentListing(output) {
-    var ids = []
-    var lines = String(output || "").split("\n")
-    for (var i = 0; i < lines.length; i++) {
-      var name = lines[i].trim()
-      if (name.slice(-5) === ".json") ids.push(name.slice(0, -5))
-    }
-    ids.sort()
-    // Same list, same objects: reassigning the model would tear down every
-    // FileView just to build identical ones.
-    if (JSON.stringify(ids) !== JSON.stringify(agentIds)) agentIds = ids
-  }
-
-  Instantiator {
-    id: agentInstantiator
-    model: root.agentIds
-
-    delegate: Agent {
-      required property var modelData
-      agentId: modelData
-      path: root.usageDir + "/" + modelData + ".json"
-      onRecordChanged: root.recordsChanged()
-    }
-
-    onObjectAdded: (index, object) => root.rebuildAgents()
-    onObjectRemoved: (index, object) => root.rebuildAgents()
-  }
-
-  function rebuildAgents() {
-    var result = []
-    for (var i = 0; i < agentInstantiator.count; i++) {
-      var agent = agentInstantiator.objectAt(i)
-      if (agent) result.push(agent)
-    }
-    agents = result
-    recordsChanged()
-  }
-
   function recordsChanged() {
     dataRevision++
     scheduleLimitsRetry()
-    scheduleSync()
   }
 
   // A collector that could not reach its limits endpoint at all — typically
@@ -229,10 +221,7 @@ Item {
     else limitsRetry.stop()
   }
 
-  Component.onCompleted: {
-    rescanAgents()
-    if (syncConfigured()) scheduleSync()
-  }
+  Component.onCompleted: readState()
 
   // -------------------------------------------------------------- refresh
 
@@ -247,47 +236,53 @@ Item {
     onTriggered: root.runUpdate("normal")
   }
 
-  Process {
-    id: updateProcess
-    running: false
-    onExited: {
-      root.rescanAgents()
+  // Omarchy's own collectors, from /usr/bin. A forced run of all collectors
+  // took about 4 s on the development machine; 300 s leaves room for a slow
+  // network.
+  LimitedProcess {
+    id: updateRun
+    label: "omarchy-agent-usage-update"
+    panelScript: root.panelScript
+    environment: root.closedEnv
+    timeoutSec: 300
+    maxOut: 65536
+    maxErr: 262144
+    onDone: (ok, exitCode, output) => {
+      root.readState()
       if (root.pendingUpdateKind !== "") {
         var kind = root.pendingUpdateKind
         root.pendingUpdateKind = ""
         root.runUpdate(kind)
       }
     }
-
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (text.trim() !== "") console.warn("agents", text.trim())
-    }
   }
 
   function updateCommand(kind, agentIds) {
-    var command = ["omarchy-agent-usage-update"]
+    var command = ["/usr/bin/omarchy-agent-usage-update"]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
     var providers = settings && settings.providers ? settings.providers : {}
     for (var id in providers) {
-      if (providers[id] && providers[id].enabled === false) command.push("--except", id)
+      if (providers[id] && providers[id].enabled === false && validId(id)) command.push("--except", id)
     }
     if (agentIds) {
-      for (var i = 0; i < agentIds.length; i++) command.push(agentIds[i])
+      for (var i = 0; i < agentIds.length; i++) {
+        if (validId(agentIds[i])) command.push(String(agentIds[i]))
+      }
     }
     return command
   }
 
   function runUpdate(kind, agentIds) {
-    if (updateProcess.running) {
+    // A retry for named agents with no valid id left would run every collector.
+    if (agentIds && agentIds.filter(function(id) { return root.validId(id) }).length === 0) return
+    if (updateRun.running) {
       // Collapse queued requests to one full rerun; a forced refresh outranks
       // the cheaper kinds it might have been queued behind.
       if (kind === "force" || root.pendingUpdateKind === "") root.pendingUpdateKind = kind
       return
     }
-    updateProcess.command = updateCommand(kind, agentIds)
-    updateProcess.running = true
+    updateRun.start(updateCommand(kind, agentIds))
   }
 
   function refresh() { refreshAll(true) }
@@ -300,6 +295,7 @@ Item {
   // another walk over every transcript on disk — the collectors reuse their
   // recent scans in this mode.
   function refreshLimits() {
+    readState()
     runUpdate("limits")
     runCswapBridge()
   }
@@ -307,32 +303,18 @@ Item {
   // ------------------------------------------------------------- providers
 
   // An agent earns a place in the bar and the panel by being switched on in
-  // settings and having actually produced numbers — locally or on a synced
-  // device. With nothing to show, the whole module collapses out of the bar
-  // rather than sitting there dimmed.
+  // settings and having actually produced numbers. With nothing to show, the
+  // whole module collapses out of the bar rather than sitting there dimmed.
   property var enabledProviders: {
     var rev = dataRevision
-    var syncRev = syncRevision
     var result = []
-    var localIds = {}
     for (var i = 0; i < agents.length; i++) {
       var record = agents[i] ? agents[i].record : null
       if (!record || !record.id) continue
       var id = String(record.id)
-      localIds[id] = true
       if (!providerEnabled(id)) continue
       var display = displayProvider(record)
       if (providerHasData(display)) result.push(display)
-    }
-    // An agent that only ever ran on another machine has no local record, but
-    // its synced numbers still deserve a tab. Rate limits stay blank — they
-    // are per-account and never travel.
-    var syncedProviders = syncConfigured() && aggregateData && aggregateData.providers ? aggregateData.providers : {}
-    for (var syncedId in syncedProviders) {
-      if (localIds[syncedId] || !providerEnabled(syncedId)) continue
-      var stats = syncedProviders[syncedId] || {}
-      var syncedDisplay = displayProvider({ id: syncedId, name: stats.providerName || syncedId })
-      if (providerHasData(syncedDisplay)) result.push(syncedDisplay)
     }
     // claude-swap tabs keep the account order, so key 1 is always account 1,
     // whichever account is active. Other tabs follow in their usual order.
@@ -357,7 +339,7 @@ Item {
   }
 
   // A prepaid agent's credit ledger. Like rate limits, the balance is
-  // per-account and never merged across devices.
+  // per-account.
   function balanceValue(raw) {
     if (!raw || typeof raw !== "object") return null
     var remaining = Number(raw.remaining)
@@ -373,9 +355,6 @@ Item {
   }
 
   function displayProvider(record) {
-    var stats = syncedStatsFor(String(record.id))
-    var synced = !!stats
-    var deviceCount = synced ? Number(stats.deviceCount || aggregateData.deviceCount || 0) : 0
     var cswap = cswapFields(record)
 
     return {
@@ -384,31 +363,25 @@ Item {
       cswapNumber: cswap.number,
       cswapActive: cswap.active,
       cswapEmail: cswap.email,
-      ready: record.ready === true || synced,
+      ready: record.ready === true,
       usageStatusText: String(record.usageStatusText || ""),
       authHelpText: String(record.authHelpText || ""),
 
-      // Rate limits and balances stay per-account and are never merged
-      // across devices.
       limits: Array.isArray(record.limits) ? record.limits : [],
       tierLabel: String(record.tierLabel || ""),
       balance: balanceValue(record.balance),
 
-      todayPrompts: synced ? numberValue(stats.todayPrompts) : numberValue(record.todayPrompts),
-      todaySessions: synced ? numberValue(stats.todaySessions) : numberValue(record.todaySessions),
-      todayTotalTokens: synced ? numberValue(stats.todayTotalTokens) : numberValue(record.todayTotalTokens),
-      todayTokensByModel: synced ? (stats.todayTokensByModel || ({})) : (record.todayTokensByModel || ({})),
-      recentDays: synced ? (stats.recentDays || []) : (record.recentDays || []),
-      totalPrompts: synced ? numberValue(stats.totalPrompts) : numberValue(record.totalPrompts),
-      totalSessions: synced ? numberValue(stats.totalSessions) : numberValue(record.totalSessions),
-      activeDays: synced ? numberValue(stats.activeDays) : numberValue(record.activeDays),
-      modelUsage: synced ? (stats.modelUsage || ({})) : (record.modelUsage || ({})),
-      hasLocalStats: synced ? (stats.hasLocalStats !== false) : (record.hasLocalStats !== false),
-      hasPromptStats: synced ? (stats.hasPromptStats !== false) : (record.hasPromptStats !== false),
-
-      syncEnabled: synced,
-      syncDeviceCount: deviceCount,
-      syncUpdatedAt: aggregateData && aggregateData.updatedAt ? aggregateData.updatedAt : ""
+      todayPrompts: numberValue(record.todayPrompts),
+      todaySessions: numberValue(record.todaySessions),
+      todayTotalTokens: numberValue(record.todayTotalTokens),
+      todayTokensByModel: record.todayTokensByModel || ({}),
+      recentDays: record.recentDays || [],
+      totalPrompts: numberValue(record.totalPrompts),
+      totalSessions: numberValue(record.totalSessions),
+      activeDays: numberValue(record.activeDays),
+      modelUsage: record.modelUsage || ({}),
+      hasLocalStats: record.hasLocalStats !== false,
+      hasPromptStats: record.hasPromptStats !== false
     }
   }
 
@@ -417,445 +390,9 @@ Item {
     return value === undefined || value === null ? fallback : value
   }
 
-  // ------------------------------------------------------------------ sync
-
-  property var syncModeSetting: setting("syncMode", setting("syncEnabled", false))
-  property bool syncEnabled: parseSyncEnabled(syncModeSetting)
-  property string syncDir: String(setting("syncDir", ""))
-  property string syncFileName: String(setting("syncFileName", ""))
-  property string syncDeviceId: String(setting("syncDeviceId", ""))
-  property string detectedHostname: ""
-  readonly property string syncEffectiveDir: expandPath(syncDir)
-  readonly property string syncEffectiveFileName: safeSnapshotFileName(syncFileName, syncDeviceId)
-  readonly property string syncEffectiveDeviceId: safeDeviceId(syncDeviceId || syncEffectiveFileName.replace(/\.json$/i, ""))
-  readonly property string syncSnapshotPath: syncConfigured() ? syncEffectiveDir + "/" + syncEffectiveFileName : home + "/.cache/omarchy/agents-disabled.json"
-  property var aggregateData: ({})
-  property int syncRevision: 0
-  property bool syncRunning: false
-  property bool syncRequestedWhileRunning: false
-  property string syncStatusText: ""
-  property double aggregateUpdatedAtMs: aggregateData && aggregateData.updatedAtMs ? Number(aggregateData.updatedAtMs) : 0
-
-  onSyncEnabledChanged: syncSettingsChanged()
-  onSyncDirChanged: syncSettingsChanged()
-  onSyncFileNameChanged: if (syncConfigured()) scheduleSync()
-  onSyncDeviceIdChanged: if (syncConfigured()) scheduleSync()
-
-  Timer {
-    id: syncDebounce
-    interval: 1000
-    repeat: false
-    onTriggered: root.runSync()
-  }
-
-  Process {
-    id: syncMkdirProcess
-    running: false
-    onRunningChanged: root.updateSyncRunning()
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        if (root.syncConfigured()) root.syncStatusText = "Usage sync mkdir failed"
-        root.finishSyncRun()
-        return
-      }
-      root.writeSyncSnapshot()
-    }
-  }
-
-  Process {
-    id: syncScanProcess
-    running: false
-    onRunningChanged: root.updateSyncRunning()
-    onExited: function(exitCode) {
-      if (exitCode !== 0 && root.syncConfigured()) root.syncStatusText = "Usage sync scan failed"
-      root.finishSyncRun()
-    }
-
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.parseSyncScanOutput(text)
-    }
-
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (text.trim() !== "") console.warn("agents/sync", text.trim())
-    }
-  }
-
-  FileView {
-    id: syncSnapshotFile
-    path: root.syncSnapshotPath
-    watchChanges: false
-    atomicWrites: true
-    printErrors: false
-  }
-
-  FileView {
-    id: hostnameFile
-    path: "/etc/hostname"
-    watchChanges: false
-    printErrors: false
-    onLoaded: root.detectedHostname = String(text() || "").trim()
-  }
-
-  function parseSyncEnabled(value) {
-    if (value === true) return true
-    var text = String(value || "").trim().toLowerCase()
-    return text === "on" || text === "enabled" || text === "true" || text === "yes" || text === "1"
-  }
-
-  function syncConfigured() {
-    return root.syncEnabled === true && String(root.syncDir || "").trim() !== ""
-  }
-
-  function syncSettingsChanged() {
-    if (syncConfigured()) {
-      scheduleSync()
-    } else {
-      syncDebounce.stop()
-      syncRequestedWhileRunning = false
-      aggregateData = ({})
-      syncStatusText = ""
-      syncRevision++
-    }
-  }
-
-  function updateSyncRunning() {
-    root.syncRunning = syncMkdirProcess.running || syncScanProcess.running
-  }
-
-  function scheduleSync() {
-    if (!syncConfigured()) return
-    syncDebounce.restart()
-  }
-
-  function runSync() {
-    if (!syncConfigured()) return
-    if (root.syncRunning) {
-      syncRequestedWhileRunning = true
-      return
-    }
-
-    syncRequestedWhileRunning = false
-    syncStatusText = ""
-    syncMkdirProcess.command = ["mkdir", "-p", root.syncEffectiveDir]
-    syncMkdirProcess.running = true
-  }
-
-  function writeSyncSnapshot() {
-    if (!syncConfigured()) {
-      finishSyncRun()
-      return
-    }
-    syncSnapshotFile.setText(JSON.stringify(localSnapshot(), null, 2) + "\n")
-    Qt.callLater(root.startSyncScan)
-  }
-
-  function startSyncScan() {
-    if (!syncConfigured()) {
-      finishSyncRun()
-      return
-    }
-    // Read at most 5 MB per snapshot with head, not cat: the files come from
-    // other machines through the sync folder, and a normal snapshot is far
-    // smaller than this, so the limit only stops an oversized or endless file.
-    var script = "dir=$0; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] || continue; printf '===%s===\\n' \"$f\"; head -c 5242880 \"$f\"; printf '\\n=== EOM ===\\n'; done"
-    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir]
-    syncScanProcess.running = true
-  }
-
-  function finishSyncRun() {
-    if (syncRequestedWhileRunning && syncConfigured()) {
-      syncRequestedWhileRunning = false
-      scheduleSync()
-    }
-  }
-
-  function expandPath(path) {
-    var value = String(path || "").trim()
-    if (value === "") return ""
-    if (value === "~") return home
-    if (value.indexOf("~/") === 0) return home + value.substring(1)
-    if (value.indexOf("$HOME/") === 0) return home + value.substring(5)
-    if (value.charAt(0) !== "/") return home + "/" + value
-    return value
-  }
-
-  function safeDeviceId(raw) {
-    var value = String(raw || "").trim()
-    if (value === "") value = Quickshell.env("HOSTNAME") || root.detectedHostname || Quickshell.env("HOST") || Quickshell.env("USER") || "device"
-    value = value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "")
-    if (value === "") value = "device"
-    return value.length > 80 ? value.substring(0, 80) : value
-  }
-
-  function safeSnapshotFileName(rawFileName, rawDeviceId) {
-    var value = String(rawFileName || "").trim()
-    if (value === "") value = safeDeviceId(rawDeviceId) + ".json"
-    value = value.split("/").pop().replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "")
-    if (value === "") value = safeDeviceId(rawDeviceId) + ".json"
-    if (!/\.json$/i.test(value)) value += ".json"
-    return value.length > 100 ? value.substring(0, 95) + ".json" : value
-  }
-
-  function parseSyncScanOutput(output) {
-    // A synced fleet is a handful of devices. Stop after this many snapshots
-    // so a sync folder stuffed with extra files cannot make the merge below
-    // run without end. Each file is already limited to 5 MB by the scan.
-    var MAX_SNAPSHOTS = 128
-    var lines = String(output || "").split("\n")
-    var snapshots = []
-    var currentPath = ""
-    var currentJson = []
-    var capReported = false
-
-    function flush() {
-      if (currentPath === "") return
-      if (snapshots.length >= MAX_SNAPSHOTS) {
-        if (!capReported) {
-          console.warn("agents/sync", "Too many snapshots; reading the first", MAX_SNAPSHOTS)
-          capReported = true
-        }
-        currentPath = ""
-        currentJson = []
-        return
-      }
-      var raw = currentJson.join("\n").trim()
-      try {
-        var parsed = JSON.parse(raw)
-        if (parsed && parsed.providers) snapshots.push(parsed)
-      } catch (e) {
-        console.warn("agents/sync", "Ignoring bad snapshot", currentPath, e)
-      }
-      currentPath = ""
-      currentJson = []
-    }
-
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i]
-      var start = line.match(/^===(.+)===$/)
-      if (start && line !== "=== EOM ===") {
-        flush()
-        currentPath = start[1]
-        currentJson = []
-        continue
-      }
-      if (line === "=== EOM ===") {
-        flush()
-        continue
-      }
-      if (currentPath !== "") currentJson.push(line)
-    }
-    flush()
-
-    aggregateData = aggregateSnapshots(snapshots)
-    syncStatusText = ""
-    syncRevision++
-  }
-
-  function cloneValue(value, fallback) {
-    if (value === undefined || value === null) return fallback
-    try {
-      return JSON.parse(JSON.stringify(value))
-    } catch (e) {
-      return fallback
-    }
-  }
-
   function numberValue(value) {
     var n = Number(value || 0)
     return isFinite(n) ? Math.round(n) : 0
-  }
-
-  function dateString(date) {
-    var y = date.getFullYear()
-    var m = String(date.getMonth() + 1).padStart(2, "0")
-    var d = String(date.getDate()).padStart(2, "0")
-    return y + "-" + m + "-" + d
-  }
-
-  function recentDateStrings() {
-    var result = []
-    for (var offset = 6; offset >= 0; offset--) {
-      var date = new Date()
-      date.setDate(date.getDate() - offset)
-      result.push(dateString(date))
-    }
-    return result
-  }
-
-  function emptyTokenBucket() {
-    return { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }
-  }
-
-  // Device-scoped stats add up across machines; account-scoped stats
-  // (Fireworks' billing API) are replicas of the same upstream truth on
-  // every synced device, so the widest value wins — summing them would
-  // double every token per machine.
-  function combineNumber(additive, current, value) {
-    return additive ? numberValue(current) + numberValue(value) : Math.max(numberValue(current), numberValue(value))
-  }
-
-  function combineObjectNumbers(additive, target, source) {
-    if (!source) return
-    for (var key in source) target[key] = combineNumber(additive, target[key], source[key])
-  }
-
-  function aggregateSnapshots(snapshots) {
-    var dates = recentDateStrings()
-    var devices = {}
-    var providers = {}
-
-    function providerAcc(id) {
-      if (providers[id]) return providers[id]
-      var recentByDay = {}
-      for (var d = 0; d < dates.length; d++) recentByDay[dates[d]] = 0
-      providers[id] = {
-        providerId: id,
-        providerName: "",
-        ready: false,
-        hasLocalStats: false,
-        hasPromptStats: false,
-        todayPrompts: 0,
-        todaySessions: 0,
-        todayTotalTokens: 0,
-        todayTokensByModel: ({}),
-        recentByDay: recentByDay,
-        totalPrompts: 0,
-        totalSessions: 0,
-        activeDays: 0,
-        activeDates: ({}),
-        modelUsage: ({}),
-        devices: ({})
-      }
-      return providers[id]
-    }
-
-    for (var i = 0; i < snapshots.length; i++) {
-      var snapshot = snapshots[i]
-      var device = safeDeviceId(snapshot.deviceId || "device")
-      devices[device] = true
-      var snapshotProviders = snapshot.providers || {}
-      for (var providerId in snapshotProviders) {
-        var stats = snapshotProviders[providerId] || {}
-        var acc = providerAcc(String(providerId))
-        acc.devices[device] = true
-        if (stats.providerName && acc.providerName === "") acc.providerName = String(stats.providerName)
-        acc.ready = acc.ready || stats.ready === true
-        acc.hasLocalStats = acc.hasLocalStats || stats.hasLocalStats !== false
-        // Snapshots from before the field existed only came from agents that
-        // count prompts, so a missing value reads as true.
-        acc.hasPromptStats = acc.hasPromptStats || stats.hasPromptStats !== false
-        var additive = String(stats.scope || "device") !== "account"
-        acc.todayPrompts = combineNumber(additive, acc.todayPrompts, stats.todayPrompts)
-        acc.todaySessions = combineNumber(additive, acc.todaySessions, stats.todaySessions)
-        acc.todayTotalTokens = combineNumber(additive, acc.todayTotalTokens, stats.todayTotalTokens)
-        acc.totalPrompts = combineNumber(additive, acc.totalPrompts, stats.totalPrompts)
-        acc.totalSessions = combineNumber(additive, acc.totalSessions, stats.totalSessions)
-        // Active days overlap between machines, so union the dates rather than
-        // summing counts. Snapshots written before activeDates existed only
-        // carry a count; the widest one stands in for them.
-        var activeDates = Array.isArray(stats.activeDates) ? stats.activeDates : []
-        for (var ad = 0; ad < activeDates.length; ad++) acc.activeDates[String(activeDates[ad])] = true
-        acc.activeDays = Math.max(acc.activeDays, numberValue(stats.activeDays))
-        combineObjectNumbers(additive, acc.todayTokensByModel, stats.todayTokensByModel || {})
-
-        var recent = Array.isArray(stats.recentDays) ? stats.recentDays : []
-        for (var r = 0; r < recent.length; r++) {
-          var day = recent[r] || {}
-          var date = String(day.date || "")
-          if (acc.recentByDay[date] !== undefined)
-            acc.recentByDay[date] = combineNumber(additive, acc.recentByDay[date], day.messageCount)
-        }
-
-        var usage = stats.modelUsage || {}
-        for (var modelId in usage) {
-          var bucket = acc.modelUsage[modelId]
-          if (!bucket) bucket = acc.modelUsage[modelId] = emptyTokenBucket()
-          combineObjectNumbers(additive, bucket, usage[modelId] || {})
-        }
-      }
-    }
-
-    var outProviders = {}
-    for (var id in providers) {
-      var acc = providers[id]
-      var recentDays = []
-      for (var di = 0; di < dates.length; di++) recentDays.push({ date: dates[di], messageCount: acc.recentByDay[dates[di]] || 0 })
-      var providerDevices = Object.keys(acc.devices).sort()
-      outProviders[id] = {
-        providerId: acc.providerId,
-        providerName: acc.providerName,
-        ready: acc.ready || providerDevices.length > 0,
-        hasLocalStats: acc.hasLocalStats,
-        hasPromptStats: acc.hasPromptStats,
-        todayPrompts: acc.todayPrompts,
-        todaySessions: acc.todaySessions,
-        todayTotalTokens: acc.todayTotalTokens,
-        todayTokensByModel: acc.todayTokensByModel,
-        recentDays: recentDays,
-        totalPrompts: acc.totalPrompts,
-        totalSessions: acc.totalSessions,
-        activeDays: Math.max(acc.activeDays, Object.keys(acc.activeDates).length),
-        modelUsage: acc.modelUsage,
-        deviceCount: providerDevices.length,
-        devices: providerDevices
-      }
-    }
-
-    return {
-      schemaVersion: 1,
-      updatedAt: new Date().toISOString(),
-      updatedAtMs: Date.now(),
-      deviceCount: Object.keys(devices).length,
-      devices: Object.keys(devices).sort(),
-      providers: outProviders
-    }
-  }
-
-  // Snapshots keep the field names older Omarchy versions wrote, so a fleet
-  // of machines on mixed versions still merges cleanly in both directions.
-  function providerSnapshot(record) {
-    return {
-      providerId: String(record.id),
-      providerName: String(record.name || record.id),
-      ready: record.ready === true,
-      hasLocalStats: record.hasLocalStats !== false,
-      hasPromptStats: record.hasPromptStats !== false,
-      scope: String(record.scope || "device"),
-      todayPrompts: numberValue(record.todayPrompts),
-      todaySessions: numberValue(record.todaySessions),
-      todayTotalTokens: numberValue(record.todayTotalTokens),
-      todayTokensByModel: cloneValue(record.todayTokensByModel, ({})),
-      recentDays: cloneValue(record.recentDays, []),
-      totalPrompts: numberValue(record.totalPrompts),
-      totalSessions: numberValue(record.totalSessions),
-      activeDays: numberValue(record.activeDays),
-      activeDates: cloneValue(record.activeDates, []),
-      modelUsage: cloneValue(record.modelUsage, ({}))
-    }
-  }
-
-  function localSnapshot() {
-    var providerMap = {}
-    for (var i = 0; i < agents.length; i++) {
-      var record = agents[i] ? agents[i].record : null
-      if (!record || !record.id) continue
-      if (!providerEnabled(String(record.id))) continue
-      providerMap[String(record.id)] = providerSnapshot(record)
-    }
-    return {
-      schemaVersion: 1,
-      deviceId: syncEffectiveDeviceId,
-      updatedAt: new Date().toISOString(),
-      providers: providerMap
-    }
-  }
-
-  function syncedStatsFor(providerId) {
-    var rev = syncRevision
-    if (!syncConfigured() || !aggregateData || !aggregateData.providers) return null
-    return aggregateData.providers[providerId] || null
   }
 
   // ---------------------------------------------------------------- format

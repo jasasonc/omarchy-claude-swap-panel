@@ -1,0 +1,1098 @@
+#!/usr/bin/python3 -IB
+"""Helper for the Claude Swap Panel plugin.
+
+The panel starts this file as `/usr/bin/python3 -I -B cswap-panel ...` with a
+closed environment. Subcommands:
+
+  run --timeout S --max-out N --max-err N -- /abs/command [args...]
+      Run a command in its own process group with a deadline and live byte
+      caps on stdout and stderr. Everything it starts is killed at the end.
+  state
+      Print the usage records and the claude-swap status as one JSON object.
+  bridge
+      Run `cswap list --json` and write one usage record per inactive account.
+  switch NUMBER NAME
+      Switch Claude Code to a claude-swap account and show the result.
+
+State lives in fixed folders under the home directory from the password
+database, not from the environment. Each folder is opened one component at a
+time without following symlinks, and must be owned by the user and not
+writable by group or others. Files are opened the same way, relative to the
+folder descriptor.
+"""
+
+import ctypes
+import datetime as dt
+import errno
+import json
+import os
+import pwd
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+UID = os.getuid()
+HOME_DIR = pwd.getpwuid(UID).pw_dir
+
+USAGE_PARTS = (".local", "state", "omarchy", "agents", "usage")
+STATUS_PARTS = (".local", "state", "cswap-omarchy")
+PREFIX = "cswap-"
+
+# A record id is also its file name, without ".json".
+ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,79}")
+ACCOUNT_FILE_RE = re.compile(r"cswap-[a-z0-9][a-z0-9-]{0,79}\.json")
+
+# The only variables a child process gets. PATH is always the system PATH.
+ENV_KEYS = ("OMARCHY_PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "CLAUDE_CONFIG_DIR", "CODEX_HOME")
+SYSTEM_PATH = "/usr/bin:/bin"
+
+USAGE_UPDATE = "/usr/bin/omarchy-agent-usage-update"
+NOTIFY_SEND = "/usr/bin/notify-send"
+
+# User tools live in the user's home. Only these fixed paths are tried.
+CSWAP_CANDIDATES = (
+  os.path.join(HOME_DIR, ".local/bin/cswap"),
+  os.path.join(HOME_DIR, ".local/share/uv/tools/claude-swap/bin/cswap"),
+)
+
+# Limits for the state reader.
+MAX_RECORD_BYTES = 1024 * 1024
+MAX_TOTAL_BYTES = 2 * 1024 * 1024
+MAX_STATUS_BYTES = 64 * 1024
+MAX_RECORDS = 64
+MAX_DIR_ENTRIES = 1024
+MAX_DEPTH = 16
+MAX_NODES = 50000
+MAX_PROBLEMS = 20
+
+# Limits for the commands that bridge and switch run.
+LIST_TIMEOUT = 120
+MAX_LIST_BYTES = 4 * 1024 * 1024
+MAX_ACCOUNTS = 32
+SWITCH_TIMEOUT = 60
+NOTIFY_TIMEOUT = 10
+UPDATE_TIMEOUT = 90
+MAX_SMALL_OUTPUT = 64 * 1024
+
+# Exit codes of `run` that a target cannot be mistaken for.
+EXIT_DEADLINE = 200
+EXIT_CAP = 201
+EXIT_RUNNER = 202
+KILL_GRACE = 2.0
+CHUNK = 4096
+PR_SET_PDEATHSIG = 1
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def log(message: str) -> None:
+  try:
+    sys.stderr.write(f"cswap-panel: {message}\n")
+    sys.stderr.flush()
+  except OSError:
+    pass
+
+
+def child_env() -> dict:
+  env = {key: os.environ[key] for key in ENV_KEYS if key in os.environ}
+  env["PATH"] = SYSTEM_PATH
+  return env
+
+
+# ---------------------------------------------------------------- folders
+
+
+class Unsafe(Exception):
+  pass
+
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
+
+def reason(exc: OSError) -> str:
+  # O_NOFOLLOW gives ELOOP for a symlink, and ENOTDIR with O_DIRECTORY.
+  if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+    return "it is a symlink or not a directory" if exc.errno == errno.ENOTDIR else "it is a symlink"
+  return exc.strerror or str(exc)
+
+
+def check_private_dir(fd: int, label: str) -> None:
+  st = os.fstat(fd)
+  if not stat.S_ISDIR(st.st_mode):
+    raise Unsafe(f"{label} is not a directory")
+  if st.st_uid != UID:
+    raise Unsafe(f"{label} is not owned by the user")
+  if st.st_mode & 0o022:
+    raise Unsafe(f"{label} is writable by group or others")
+
+
+def open_tree(parts, create: bool = False):
+  """Open HOME/parts... one component at a time and return the descriptor.
+
+  Returns None when a component is missing and create is False. A missing
+  component is made with mode 0700 when create is True. Raises Unsafe for a
+  symlink, a non-directory, a foreign owner or group/other write access.
+  """
+  if not os.path.isabs(HOME_DIR):
+    raise Unsafe("the home directory is not an absolute path")
+  try:
+    fd = os.open(HOME_DIR, DIR_FLAGS)
+  except OSError as exc:
+    raise Unsafe(f"cannot open the home directory: {exc.strerror}")
+  label = "~"
+  try:
+    check_private_dir(fd, label)
+    for name in parts:
+      label += "/" + name
+      try:
+        child = os.open(name, DIR_FLAGS, dir_fd=fd)
+      except FileNotFoundError:
+        if not create:
+          os.close(fd)
+          return None
+        try:
+          os.mkdir(name, 0o700, dir_fd=fd)
+        except FileExistsError:
+          pass
+        try:
+          child = os.open(name, DIR_FLAGS, dir_fd=fd)
+        except OSError as exc:
+          raise Unsafe(f"cannot open {label}: {reason(exc)}")
+      except OSError as exc:
+        raise Unsafe(f"cannot open {label}: {reason(exc)}")
+      os.close(fd)
+      fd = child
+      check_private_dir(fd, label)
+    return fd
+  except BaseException:
+    os.close(fd)
+    raise
+
+
+def read_file(dir_fd: int, name: str, limit: int):
+  """Read a regular file owned by the user, relative to dir_fd.
+
+  Returns the bytes, or None if the file does not exist. Raises Unsafe for a
+  symlink, a non-regular file, a foreign owner or a file above the limit.
+  """
+  try:
+    fd = os.open(name, FILE_FLAGS, dir_fd=dir_fd)
+  except FileNotFoundError:
+    return None
+  except OSError as exc:
+    raise Unsafe(f"{ascii(name)}: {reason(exc)}")
+  try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+      raise Unsafe(f"{ascii(name)} is not a regular file")
+    if st.st_uid != UID:
+      raise Unsafe(f"{ascii(name)} is not owned by the user")
+    if st.st_size > limit:
+      raise Unsafe(f"{ascii(name)} is larger than {limit} bytes")
+    chunks = []
+    total = 0
+    while True:
+      chunk = os.read(fd, min(65536, limit + 1 - total))
+      if not chunk:
+        break
+      total += len(chunk)
+      if total > limit:
+        raise Unsafe(f"{ascii(name)} is larger than {limit} bytes")
+      chunks.append(chunk)
+    return b"".join(chunks)
+  finally:
+    os.close(fd)
+
+
+def reject_constant(name):
+  raise ValueError(f"{name} is not allowed")
+
+
+def parse_json(data: bytes):
+  return json.loads(data, parse_constant=reject_constant)
+
+
+def within_structure_caps(value) -> bool:
+  stack = [(value, 1)]
+  nodes = 0
+  while stack:
+    item, depth = stack.pop()
+    nodes += 1
+    if nodes > MAX_NODES or depth > MAX_DEPTH:
+      return False
+    if isinstance(item, dict):
+      stack.extend((child, depth + 1) for child in item.values())
+    elif isinstance(item, list):
+      stack.extend((child, depth + 1) for child in item)
+  return True
+
+
+def dump_json(value) -> str:
+  # ASCII only, and no NaN or Infinity, which JSON.parse in QML rejects.
+  return json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+
+def write_if_changed(dir_fd: int, name: str, record: dict) -> None:
+  def same(a: dict, b: dict) -> bool:
+    return {k: v for k, v in a.items() if k != "updatedAt"} == {k: v for k, v in b.items() if k != "updatedAt"}
+
+  try:
+    existing = parse_json(read_file(dir_fd, name, MAX_RECORD_BYTES) or b"null")
+  except (Unsafe, ValueError, RecursionError):
+    existing = None
+  if isinstance(existing, dict) and same(existing, record):
+    return
+  # The temp name does not end in .json, so the panel never reads a
+  # half-written file. O_EXCL and O_NOFOLLOW create a new file and never
+  # open one that is already there.
+  tmp = f".{name[:-5]}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+  fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+  try:
+    with os.fdopen(fd, "w", encoding="ascii") as handle:
+      handle.write(dump_json(record) + "\n")
+    os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+  except BaseException:
+    try:
+      os.unlink(tmp, dir_fd=dir_fd)
+    except OSError:
+      pass
+    raise
+
+
+def unlink_quiet(dir_fd: int, name: str) -> None:
+  try:
+    os.unlink(name, dir_fd=dir_fd)
+  except FileNotFoundError:
+    pass
+
+
+def list_names(dir_fd: int, problems: list) -> list:
+  names = []
+  with os.scandir(dir_fd) as entries:
+    for count, entry in enumerate(entries, 1):
+      if count > MAX_DIR_ENTRIES:
+        problems.append(f"the usage folder has more than {MAX_DIR_ENTRIES} entries; the rest are ignored")
+        break
+      names.append(entry.name)
+  return names
+
+
+# ------------------------------------------------------------------ state
+
+
+def cmd_state(args) -> int:
+  if args:
+    log("usage: cswap-panel state")
+    return 2
+  problems = []
+  out = {"status": {}, "active": None, "records": {}}
+
+  try:
+    status_fd = open_tree(STATUS_PARTS)
+  except Unsafe as exc:
+    problems.append(str(exc))
+    status_fd = None
+  if status_fd is not None:
+    try:
+      for name, key in (("status.json", "status"), ("active.json", "active")):
+        try:
+          value = parse_json(read_file(status_fd, name, MAX_STATUS_BYTES) or b"null")
+        except (Unsafe, ValueError, RecursionError) as exc:
+          problems.append(f"{name}: {exc}")
+          continue
+        if not isinstance(value, dict) or not within_structure_caps(value):
+          continue
+        try:
+          dump_json(value)
+        except (ValueError, RecursionError) as exc:
+          problems.append(f"{name}: {exc}")
+          continue
+        out[key] = value
+    finally:
+      os.close(status_fd)
+
+  try:
+    usage_fd = open_tree(USAGE_PARTS)
+  except Unsafe as exc:
+    problems.append(str(exc))
+    usage_fd = None
+  if usage_fd is not None:
+    try:
+      out["records"] = read_records(usage_fd, problems)
+    finally:
+      os.close(usage_fd)
+
+  sys.stdout.write(dump_json(out))
+  sys.stdout.flush()
+  for problem in problems[:MAX_PROBLEMS]:
+    log(problem[:300])
+  return 0
+
+
+def read_records(dir_fd: int, problems: list) -> dict:
+  names = []
+  for name in list_names(dir_fd, problems):
+    if not name.endswith(".json") or name.startswith("."):
+      continue
+    if not ID_RE.fullmatch(name[:-5]):
+      problems.append(f"skipped {ascii(name)[:100]}: the name is not a valid record id")
+      continue
+    names.append(name)
+  names.sort()
+  if len(names) > MAX_RECORDS:
+    problems.append(f"more than {MAX_RECORDS} records; the rest are ignored")
+    names = names[:MAX_RECORDS]
+
+  records = {}
+  budget = MAX_TOTAL_BYTES
+  for name in names:
+    record_id = name[:-5]
+    try:
+      record = parse_json(read_file(dir_fd, name, MAX_RECORD_BYTES) or b"null")
+    except (Unsafe, ValueError, RecursionError) as exc:
+      problems.append(f"skipped {name}: {exc}")
+      continue
+    if not isinstance(record, dict) or record.get("id") != record_id:
+      problems.append(f"skipped {name}: the id in the file does not match the file name")
+      continue
+    if not within_structure_caps(record):
+      problems.append(f"skipped {name}: nested too deep or too many values")
+      continue
+    try:
+      size = len(dump_json(record))
+    except (ValueError, RecursionError) as exc:
+      problems.append(f"skipped {name}: {exc}")
+      continue
+    if size > MAX_RECORD_BYTES or size > budget:
+      problems.append(f"skipped {name}: the records are larger than {MAX_TOTAL_BYTES} bytes together")
+      continue
+    budget -= size
+    records[record_id] = record
+  return records
+
+
+# ------------------------------------------------------------ user tools
+
+
+def find_user_binary(candidates):
+  """The first candidate that is an executable regular file, owned by the
+  user or root and not writable by group or others. Symlinks are followed
+  for the check (uv links ~/.local/bin/cswap into its tool folder), but the
+  candidate path itself is what runs.
+  """
+  for path in candidates:
+    try:
+      st = os.stat(path)
+    except OSError:
+      continue
+    if not stat.S_ISREG(st.st_mode) or st.st_uid not in (UID, 0):
+      continue
+    if st.st_mode & 0o022 or not os.access(path, os.X_OK):
+      continue
+    return path
+  return None
+
+
+class CommandFailed(Exception):
+  pass
+
+
+def capture(argv, timeout: float, max_out: int, max_err: int):
+  """Run argv with a deadline and byte caps and return (code, out, err).
+
+  The command stays in this process group, so the group kill of `run` also
+  reaches anything it leaves behind. Raises CommandFailed if it cannot start,
+  runs past the deadline or writes more than a cap.
+  """
+  try:
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=child_env(), close_fds=True)
+  except OSError as exc:
+    raise CommandFailed(f"cannot start {os.path.basename(argv[0])}: {exc.strerror}")
+  name = os.path.basename(argv[0])
+  out_fd = proc.stdout.fileno()
+  err_fd = proc.stderr.fileno()
+  out = bytearray()
+  err = bytearray()
+  streams = {out_fd: (out, max_out), err_fd: (err, max_err)}
+  deadline = time.monotonic() + timeout
+  linger_until = None
+  try:
+    while streams:
+      now = time.monotonic()
+      if now >= deadline:
+        raise CommandFailed(f"{name} ran longer than {timeout} s")
+      if proc.poll() is not None:
+        # The command ended. Stop soon even if a child still holds a pipe.
+        if linger_until is None:
+          linger_until = now + 1.0
+        elif now >= linger_until:
+          break
+      ready, _, _ = select.select(list(streams), [], [], min(deadline - now, 0.25))
+      for fd in ready:
+        buf, cap = streams[fd]
+        chunk = os.read(fd, CHUNK)
+        if not chunk:
+          del streams[fd]
+          continue
+        buf.extend(chunk)
+        if len(buf) > cap:
+          raise CommandFailed(f"{name} wrote more than {cap} bytes")
+    try:
+      code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+      raise CommandFailed(f"{name} ran longer than {timeout} s")
+  except BaseException:
+    proc.kill()
+    proc.wait()
+    raise
+  finally:
+    proc.stdout.close()
+    proc.stderr.close()
+  return code, bytes(out), bytes(err)
+
+
+# ----------------------------------------------------------------- bridge
+
+
+def parse_time(value):
+  if not value:
+    return None
+  try:
+    parsed = dt.datetime.fromisoformat(str(value)[:64].replace("Z", "+00:00"))
+  except ValueError:
+    return None
+  return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def limit_window(label: str, entry, title: str = ""):
+  if not isinstance(entry, dict) or entry.get("pct") is None:
+    return None
+  try:
+    percent = float(entry["pct"]) / 100
+  except (TypeError, ValueError, OverflowError):
+    return None
+  if percent != percent:
+    return None
+  reset = parse_time(entry.get("resetsAt"))
+  # A window that reset after the numbers were read no longer holds them.
+  if reset and reset <= dt.datetime.now(dt.timezone.utc):
+    return None
+  window = {"label": label, "percent": max(0.0, min(1.0, percent))}
+  if reset:
+    window["resetsAt"] = reset.isoformat()
+  if title:
+    window["title"] = title
+  return window
+
+
+def limits_from(usage) -> list:
+  if not isinstance(usage, dict):
+    return []
+  windows = [
+    limit_window("Session (5-hour)", usage.get("fiveHour")),
+    limit_window("Weekly (7-day)", usage.get("sevenDay")),
+  ]
+  scoped_list = usage.get("scoped")
+  for scoped in (scoped_list if isinstance(scoped_list, list) else [])[:8]:
+    name = text_field((scoped if isinstance(scoped, dict) else {}).get("name"), 40).strip()
+    if name:
+      windows.append(limit_window(f"{name} Weekly", scoped, f"{name} Weekly"))
+  return [w for w in windows if w]
+
+
+def age_text(seconds) -> str:
+  try:
+    minutes = int(float(seconds or 0) // 60)
+  except (TypeError, ValueError, OverflowError):
+    minutes = 0
+  if minutes < 1:
+    return "just now"
+  if minutes < 60:
+    return f"{minutes} min ago"
+  hours = minutes // 60
+  return f"{hours} h ago" if hours < 48 else f"{hours // 24} days ago"
+
+
+def text_field(value, limit: int = 200) -> str:
+  return str(value or "")[:limit]
+
+
+def slugify(text: str) -> str:
+  return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40].strip("-")
+
+
+def account_number(account: dict) -> int:
+  number = account.get("number")
+  if isinstance(number, int) and not isinstance(number, bool) and 0 <= number < 1000:
+    return number
+  return 0
+
+
+def names_for(accounts: list) -> list:
+  """One unique tab name per account, in account order.
+
+  The name is the alias set with `cswap alias`, else the email name before
+  the @. Accounts without an alias whose email names clash use the full
+  email. A name that is still not unique gets the account number.
+  """
+  def short(account: dict) -> str:
+    return slugify(text_field(account.get("alias")) or text_field(account.get("email")).split("@")[0])
+
+  short_names = [short(a) for a in accounts]
+  names = []
+  for account, name in zip(accounts, short_names):
+    if short_names.count(name) > 1 and not account.get("alias"):
+      name = slugify(text_field(account.get("email"))) or name
+    names.append(name)
+
+  unique = []
+  for account, name in zip(accounts, names):
+    if not name:
+      name = f"account-{account_number(account)}"
+    elif names.count(name) > 1:
+      name = f"{name}-{account_number(account)}"
+    # A suffix can match another name, so count up until the name is free.
+    base, count = name, 2
+    while name in unique:
+      name = f"{base}-{count}"
+      count += 1
+    unique.append(name)
+  return unique
+
+
+def record_for(account: dict, slug: str) -> dict:
+  email = text_field(account.get("email"))
+  status = text_field(account.get("usageStatus"))
+  usage = account.get("usage")
+  status_text = ""
+  help_text = ""
+
+  if isinstance(usage, dict):
+    limits = limits_from(usage)
+    age = account.get("usageAgeSeconds")
+    if isinstance(age, (int, float)) and age > 600:
+      status_text = f"Updated {age_text(age)}"
+  else:
+    limits = limits_from(account.get("lastGoodUsage"))
+    last_known = f", last known {age_text(account.get('lastGoodAgeSeconds'))}" if limits else ""
+    if status in ("token_expired", "relogin_required"):
+      status_text = "Sign-in expired" + last_known
+      help_text = f"Log in to Claude Code as {email}, then run: cswap add"
+    else:
+      status_text = "Usage unavailable" + last_known
+      error = text_field(account.get("usageError"))
+      help_text = f"cswap could not read the usage ({error})." if error else "cswap could not read the usage."
+
+  # The panel hides a tab with no limits at all. A negative percent keeps the
+  # tab, so an error stays visible, and the panel draws no meter for it.
+  if not limits:
+    limits = [{"label": "Weekly (7-day)", "percent": -1}]
+
+  tier = email + (" (disabled in cswap)" if account.get("disabled") else "")
+  return {
+    "schemaVersion": 1,
+    "id": PREFIX + slug,
+    "name": slug,
+    "cswapNumber": account_number(account),
+    "cswapEmail": email,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": True,
+    "hasLocalStats": False,
+    "hasPromptStats": False,
+    "tierLabel": tier,
+    "usageStatusText": status_text,
+    "authHelpText": help_text,
+    "limits": limits,
+  }
+
+
+def write_status(status_fd: int, state: str, message: str = "", accounts: int = 0, records=()) -> None:
+  # The panel watches this file for changes. It shows setup help from the
+  # state, and it reads the records again when the file changes, also after
+  # a run from bin/cswap-add-account.
+  write_if_changed(status_fd, "status.json", {
+    "state": state,
+    "message": message[:500],
+    "accounts": accounts,
+    "records": sorted(records),
+  })
+
+
+def remove_account_tabs(usage_fd: int, keep=()) -> None:
+  # Names come from the folder descriptor and removals go through it, so they
+  # stay inside the real folder. Removing a symlink removes only the link.
+  for name in list_names(usage_fd, []):
+    if ACCOUNT_FILE_RE.fullmatch(name) and name not in keep:
+      try:
+        os.unlink(name, dir_fd=usage_fd)
+      except OSError:
+        pass
+
+
+def cmd_bridge(args) -> int:
+  if args:
+    log("usage: cswap-panel bridge")
+    return 2
+  try:
+    status_fd = open_tree(STATUS_PARTS, create=True)
+  except Unsafe as exc:
+    log(f"cannot use the status folder: {exc}")
+    return 1
+  usage_fd = None
+  try:
+    cswap = find_user_binary(CSWAP_CANDIDATES)
+    if not cswap:
+      # Without claude-swap there are no account tabs. The panel shows how to install it.
+      usage_fd = open_tree(USAGE_PARTS)
+      if usage_fd is not None:
+        remove_account_tabs(usage_fd)
+      unlink_quiet(status_fd, "active.json")
+      write_status(status_fd, "missing")
+      return 0
+
+    data = None
+    try:
+      code, out, err = capture([cswap, "list", "--json"], LIST_TIMEOUT, MAX_LIST_BYTES, MAX_SMALL_OUTPUT)
+      if code != 0:
+        detail = last_lines(err, 1)
+        message = f"cswap list failed: {detail or f'exit code {code}'}"
+      else:
+        data = parse_json(out)
+        message = "" if isinstance(data, dict) else "cswap list returned no account list"
+    except CommandFailed as exc:
+      message = f"cswap list failed: {exc}"
+    except (ValueError, RecursionError) as exc:
+      message = f"cswap list failed: {str(exc)[:200]}"
+    if message:
+      # Keep the last tabs: a failed run is often temporary.
+      log(message)
+      write_status(status_fd, "error", message)
+      return 1
+
+    raw_accounts = data.get("accounts")
+    accounts = [a for a in (raw_accounts if isinstance(raw_accounts, list) else []) if isinstance(a, dict)][:MAX_ACCOUNTS]
+    active_number = data.get("activeAccountNumber")
+    usage_fd = open_tree(USAGE_PARTS, create=True)
+
+    def is_active(account: dict) -> bool:
+      return account.get("active") is True or (active_number is not None and account.get("number") == active_number)
+
+    names = names_for(accounts)
+
+    # The panel names the built-in Claude Code tab after the active account.
+    active_index = next((i for i, a in enumerate(accounts) if is_active(a)), None)
+    if active_index is not None:
+      active = accounts[active_index]
+      write_if_changed(status_fd, "active.json", {
+        "number": account_number(active), "name": names[active_index], "email": text_field(active.get("email")),
+      })
+    else:
+      unlink_quiet(status_fd, "active.json")
+
+    written = set()
+    for account, name in zip(accounts, names):
+      if is_active(account):
+        continue
+      file_name = f"{PREFIX}{name}.json"
+      write_if_changed(usage_fd, file_name, record_for(account, name))
+      written.add(file_name)
+
+    # Remove tabs for accounts that became active or left cswap.
+    remove_account_tabs(usage_fd, keep=written)
+    write_status(status_fd, "ok" if accounts else "no-accounts", accounts=len(accounts), records=written)
+    return 0
+  except (Unsafe, OSError) as exc:
+    log(f"could not update the account tabs: {exc}")
+    try:
+      write_status(status_fd, "error", f"could not update the account tabs: {exc}")
+    except (Unsafe, OSError):
+      pass
+    return 1
+  finally:
+    os.close(status_fd)
+    if usage_fd is not None:
+      os.close(usage_fd)
+
+
+# ----------------------------------------------------------------- switch
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+CONTROL_RE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
+
+
+def last_lines(data: bytes, count: int = 3) -> str:
+  text = CONTROL_RE.sub("", ANSI_RE.sub("", data.decode("utf-8", "replace")))
+  lines = [line.strip() for line in text.splitlines() if line.strip()]
+  return "\n".join(lines[-count:])[:300]
+
+
+def notify(urgency: str, summary: str, body: str) -> None:
+  try:
+    capture([NOTIFY_SEND, "-u", urgency, "-a", "Claude accounts", "--", summary, body],
+            NOTIFY_TIMEOUT, MAX_SMALL_OUTPUT, MAX_SMALL_OUTPUT)
+  except CommandFailed as exc:
+    log(str(exc))
+
+
+def cmd_switch(args) -> int:
+  if len(args) != 2 or not re.fullmatch(r"[1-9][0-9]{0,2}", args[0]):
+    log("usage: cswap-panel switch NUMBER NAME")
+    return 2
+  number = args[0]
+  name = re.sub(r"[^A-Za-z0-9@._+ -]", "", args[1])[:64].strip() or f"account {number}"
+
+  cswap = find_user_binary(CSWAP_CANDIDATES)
+  if not cswap:
+    notify("critical", f"Could not switch to {name}", "claude-swap (cswap) is not installed.")
+    return 1
+  try:
+    code, out, err = capture([cswap, "switch", number], SWITCH_TIMEOUT, MAX_SMALL_OUTPUT, MAX_SMALL_OUTPUT)
+    detail = last_lines(out + err)
+  except CommandFailed as exc:
+    code, detail = 1, str(exc)
+
+  if code == 0:
+    notify("normal", f"Claude Code now uses {name}", "Open sessions change on their next message.")
+  else:
+    notify("critical", f"Could not switch to {name}", detail)
+
+  # Omarchy's own collector writes the record of the active account.
+  try:
+    update_code, _, update_err = capture([USAGE_UPDATE, "--force", "claude"], UPDATE_TIMEOUT,
+                                         MAX_SMALL_OUTPUT, MAX_SMALL_OUTPUT)
+    if update_code != 0:
+      log(f"usage update failed: {last_lines(update_err)}")
+  except CommandFailed as exc:
+    log(str(exc))
+  return 0 if code == 0 else 1
+
+
+# -------------------------------------------------------------------- run
+
+
+class Abort(Exception):
+  def __init__(self, code: int):
+    super().__init__(code)
+    self.code = code
+
+
+def parse_run_args(args):
+  options = {"--timeout": None, "--max-out": None, "--max-err": None}
+  i = 0
+  while i < len(args) and args[i] != "--":
+    if args[i] not in options or i + 1 >= len(args):
+      raise ValueError(f"unexpected argument {ascii(args[i])[:40]}")
+    try:
+      options[args[i]] = int(args[i + 1])
+    except ValueError:
+      raise ValueError(f"{args[i]} needs a whole number")
+    i += 2
+  argv = args[i + 1:]
+  if any(value is None for value in options.values()) or not argv:
+    raise ValueError("usage: cswap-panel run --timeout S --max-out N --max-err N -- /abs/command [args...]")
+  if not 1 <= options["--timeout"] <= 3600:
+    raise ValueError("--timeout must be 1 to 3600 seconds")
+  for key in ("--max-out", "--max-err"):
+    if not 0 <= options[key] <= 64 * 1024 * 1024:
+      raise ValueError(f"{key} must be 0 to 67108864 bytes")
+  if not os.path.isabs(argv[0]):
+    raise ValueError("the command must be an absolute path")
+  return options["--timeout"], options["--max-out"], options["--max-err"], argv
+
+
+def child_pids(pid: int) -> list:
+  pids = []
+  try:
+    tasks = os.listdir(f"/proc/{pid}/task")
+  except OSError:
+    return pids
+  for task in tasks:
+    try:
+      with open(f"/proc/{pid}/task/{task}/children") as handle:
+        pids.extend(int(value) for value in handle.read().split())
+    except (OSError, ValueError):
+      pass
+  return pids
+
+
+def is_zombie(pid: int) -> bool:
+  try:
+    with open(f"/proc/{pid}/stat") as handle:
+      return handle.read().rsplit(")", 1)[1].split()[0] == "Z"
+  except (OSError, IndexError):
+    return True
+
+
+def kill_descendants(signum=None, frame=None) -> None:
+  """Kill every descendant of the keeper, then the keeper's own group.
+
+  The keeper is a child subreaper, so a descendant whose parent dies becomes
+  a child of the keeper, also when it left the process group or the session.
+  The keeper never reaps these children, so their pids stay reserved while
+  it kills them one layer at a time, from the top down.
+  """
+  me = os.getpid()
+  for _ in range(1000):
+    alive = [pid for pid in child_pids(me) if not is_zombie(pid)]
+    if not alive:
+      break
+    for pid in alive:
+      try:
+        os.kill(pid, signal.SIGKILL)
+      except ProcessLookupError:
+        pass
+    time.sleep(0.005)
+  os.killpg(0, signal.SIGKILL)
+
+
+def keeper(runner_pid: int, prctl, argv, env, out_w: int, err_w: int, status_w: int) -> None:
+  """The first child of `run`. It leads the process group, starts the target
+  in that group and reports the exit code of the target. It never returns.
+
+  SIGUSR1 from the runner, or SIGUSR2 from the kernel when the runner dies
+  (also from SIGKILL, through PR_SET_PDEATHSIG), makes the keeper kill all
+  descendants and the group.
+  """
+  try:
+    signal.set_wakeup_fd(-1)
+    os.setpgid(0, 0)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+      signal.signal(sig, signal.SIG_IGN)
+    signal.signal(signal.SIGUSR1, kill_descendants)
+    signal.signal(signal.SIGUSR2, kill_descendants)
+    zero = ctypes.c_ulong(0)
+    if prctl(PR_SET_CHILD_SUBREAPER, ctypes.c_ulong(1), zero, zero, zero) != 0:
+      os.killpg(0, signal.SIGKILL)
+    if prctl(PR_SET_PDEATHSIG, ctypes.c_ulong(signal.SIGUSR2), zero, zero, zero) != 0:
+      os.killpg(0, signal.SIGKILL)
+    if os.getppid() != runner_pid:
+      os.killpg(0, signal.SIGKILL)
+
+    target = os.fork()
+    if target == 0:
+      try:
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2,
+                    signal.SIGPIPE, signal.SIGXFSZ):
+          signal.signal(sig, signal.SIG_DFL)
+        null = os.open("/dev/null", os.O_RDONLY)
+        os.dup2(null, 0)
+        os.dup2(out_w, 1)
+        os.dup2(err_w, 2)
+        os.closerange(3, 1 << 16)
+        os.execve(argv[0], argv, env)
+      except BaseException as exc:
+        try:
+          os.write(2, f"cswap-panel run: cannot start {argv[0]}: {exc}\n".encode("utf-8", "replace"))
+        finally:
+          os._exit(EXIT_RUNNER)
+
+    os.close(out_w)
+    os.close(err_w)
+    try:
+      _, status = os.waitpid(target, 0)
+      code = os.waitstatus_to_exitcode(status)
+    except ChildProcessError:
+      code = EXIT_RUNNER
+    if code < 0:
+      code = 128 - code
+    os.write(status_w, bytes([min(code, 255)]))
+    # Stay, so the group keeps its leader until the runner asks for the kill.
+    while True:
+      signal.pause()
+  finally:
+    os._exit(EXIT_RUNNER)
+
+
+def cmd_run(args) -> int:
+  try:
+    timeout, max_out, max_err, argv = parse_run_args(args)
+  except ValueError as exc:
+    log(f"run: {exc}")
+    return EXIT_RUNNER
+
+  env = child_env()
+  prctl = ctypes.CDLL(None, use_errno=True).prctl
+  out_r, out_w = os.pipe()
+  err_r, err_w = os.pipe()
+  status_r, status_w = os.pipe()
+  wake_r, wake_w = os.pipe()
+  for fd in (wake_r, wake_w):
+    os.set_blocking(fd, False)
+
+  stop = []
+  for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, lambda signum, frame: stop.append(signum))
+  signal.set_wakeup_fd(wake_w)
+
+  runner_pid = os.getpid()
+  group = os.fork()
+  if group == 0:
+    keeper(runner_pid, prctl, argv, env, out_w, err_w, status_w)
+  # Both sides set the group, so it exists before either side goes on.
+  try:
+    os.setpgid(group, group)
+  except OSError:
+    pass
+  os.close(out_w)
+  os.close(err_w)
+  os.close(status_w)
+  # Our own output must not block the loop, or the deadline could pass unseen.
+  for fd in (1, 2):
+    os.set_blocking(fd, False)
+
+  deadline = time.monotonic() + timeout
+  # read end -> [bytes so far, cap, where to relay]
+  streams = {out_r: [0, max_out, 1], err_r: [0, max_err, 2]}
+  reaped = []
+
+  def check_stop():
+    if stop:
+      raise Abort(128 + stop[0])
+    if time.monotonic() >= deadline:
+      raise Abort(EXIT_DEADLINE)
+
+  def drain_wake():
+    try:
+      while os.read(wake_r, 64):
+        pass
+    except BlockingIOError:
+      pass
+
+  def relay(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+      try:
+        view = view[os.write(fd, view):]
+      except BlockingIOError:
+        check_stop()
+        select.select([wake_r], [fd], [], max(0.0, deadline - time.monotonic()))
+        drain_wake()
+      except OSError:
+        raise Abort(EXIT_RUNNER)
+
+  def read_stream(fd: int, forward: bool) -> None:
+    chunk = os.read(fd, CHUNK)
+    if not chunk:
+      del streams[fd]
+      os.close(fd)
+      return
+    entry = streams[fd]
+    entry[0] += len(chunk)
+    if entry[0] > entry[1]:
+      raise Abort(EXIT_CAP)
+    if forward:
+      relay(entry[2], chunk)
+
+  def kill_all() -> None:
+    # The keeper kills every descendant, also one that left the group, and
+    # then itself. If it does not end in time, kill the group directly.
+    if reaped:
+      return
+    try:
+      os.kill(group, signal.SIGUSR1)
+    except ProcessLookupError:
+      pass
+    end = time.monotonic() + KILL_GRACE
+    while time.monotonic() < end:
+      try:
+        if os.waitpid(group, os.WNOHANG)[0]:
+          reaped.append(group)
+          return
+      except ChildProcessError:
+        reaped.append(group)
+        return
+      time.sleep(0.01)
+    for target in (lambda: os.killpg(group, signal.SIGKILL), lambda: os.kill(group, signal.SIGKILL)):
+      try:
+        target()
+      except ProcessLookupError:
+        pass
+    try:
+      os.waitpid(group, 0)
+    except ChildProcessError:
+      pass
+    reaped.append(group)
+
+  child_code = None
+  try:
+    while child_code is None:
+      check_stop()
+      watched = list(streams) + [status_r, wake_r]
+      ready, _, _ = select.select(watched, [], [], max(0.0, deadline - time.monotonic()))
+      for fd in ready:
+        if fd == wake_r:
+          drain_wake()
+        elif fd == status_r:
+          data = os.read(status_r, 1)
+          if not data:
+            raise Abort(EXIT_RUNNER)
+          child_code = data[0]
+        elif fd in streams:
+          read_stream(fd, True)
+    # The target ended. Kill what it left behind, then pass on the output
+    # that is still in the pipes.
+    kill_all()
+    linger = time.monotonic() + 1.0
+    while streams and time.monotonic() < linger:
+      ready, _, _ = select.select(list(streams), [], [], max(0.0, linger - time.monotonic()))
+      for fd in ready:
+        read_stream(fd, True)
+    # Codes 200 to 202 belong to the runner.
+    result = 1 if EXIT_DEADLINE <= child_code <= EXIT_RUNNER else child_code
+  except Abort as exc:
+    result = exc.code
+    what = " ".join(os.path.basename(arg) for arg in argv[:5])[:80]
+    if result == EXIT_DEADLINE:
+      log(f"run: {what} ran longer than {timeout} s; stopped it")
+    elif result == EXIT_CAP:
+      log(f"run: {what} wrote more than its output limit; stopped it")
+    # Ask the group to stop, give it a short grace, then kill everything.
+    if not reaped:
+      try:
+        os.killpg(group, signal.SIGTERM)
+      except ProcessLookupError:
+        pass
+      grace = time.monotonic() + KILL_GRACE
+      while child_code is None and time.monotonic() < grace:
+        ready, _, _ = select.select(list(streams) + [status_r], [], [], max(0.0, grace - time.monotonic()))
+        for fd in ready:
+          if fd == status_r:
+            child_code = (os.read(status_r, 1) or b"\xff")[0]
+          elif fd in streams and not os.read(fd, CHUNK):
+            del streams[fd]
+            os.close(fd)
+    kill_all()
+  except Exception as exc:
+    log(f"run: {exc}")
+    result = EXIT_RUNNER
+  finally:
+    if not reaped:
+      kill_all()
+    for fd in list(streams) + [status_r, wake_r, wake_w]:
+      os.close(fd)
+    for fd in (1, 2):
+      os.set_blocking(fd, True)
+  return result
+
+
+# ------------------------------------------------------------------- main
+
+
+COMMANDS = {"run": cmd_run, "state": cmd_state, "bridge": cmd_bridge, "switch": cmd_switch}
+
+
+def main(argv) -> int:
+  if not argv or argv[0] not in COMMANDS:
+    log("usage: cswap-panel run|state|bridge|switch ...")
+    return 2
+  return COMMANDS[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+  raise SystemExit(main(sys.argv[1:]))

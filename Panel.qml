@@ -72,8 +72,16 @@ Panel {
     usage.refreshAll(true)
   }
 
+  // The same command as the Omarchy agent key, started as a user session
+  // service through uwsm, as Omarchy starts its apps. The service gets the
+  // session environment from systemd, so the agent that the user picked is
+  // found; this process passes only the closed environment.
   function launchAgent() {
-    if (root.bar) root.bar.run("omarchy-agent --pick")
+    Quickshell.execDetached({
+      command: ["/usr/bin/uwsm-app", "-t", "service", "--", "/usr/bin/omarchy-agent", "--pick"],
+      environment: usage.closedEnv,
+      clearEnvironment: true
+    })
     root.close()
   }
 
@@ -111,28 +119,11 @@ Panel {
     var p = root.provider
     if (!canSwitch(p) || root.switchRunning) return
     root.switchArmed = false
-    root.switchRunning = true
-    switchProcess.command = ["bash", "-c", root.switchScript, "cswap-switch",
-                             String(Number(p.cswapNumber)), String(p.providerName || ""), usage.cswapPath]
-    switchProcess.running = true
-    switchDeadline.restart()
+    // `cswap-panel switch` runs cswap switch, shows the result with
+    // notify-send, and updates the record of the active account.
+    root.switchRunning = switchRun.start(usage.panelCommand.concat(
+      ["switch", String(Number(p.cswapNumber)), String(p.providerName || "")]))
   }
-
-  // $1 = cswap account number, $2 = account name for the notification,
-  // $3 = the cswap binary that cswap-omarchy found.
-  readonly property string switchScript: [
-    'cswap=$3',
-    '[ -x "$cswap" ] || cswap=$(command -v cswap)',
-    'out=$("$cswap" switch "$1" 2>&1)',
-    'status=$?',
-    'if [ $status -eq 0 ]; then',
-    '  notify-send -a "Claude accounts" "Claude Code now uses $2" "Open sessions change on their next message."',
-    'else',
-    '  notify-send -u critical -a "Claude accounts" "Could not switch to $2" "$(printf "%s" "$out" | sed "s/\\x1b\\[[0-9;]*m//g" | tail -n 3)"',
-    'fi',
-    'omarchy-agent-usage-update --force claude',
-    'exit $status'
-  ].join("\n")
 
   Timer {
     interval: 3000
@@ -140,34 +131,22 @@ Panel {
     onTriggered: root.switchArmed = false
   }
 
-  Process {
-    id: switchProcess
-    running: false
-    environment: ({ "PATH": usage.hardenedPath })
-    onExited: function(exitCode, exitStatus) {
-      switchDeadline.stop()
+  // A switch runs cswap and can wait on a login, so it gets a generous
+  // deadline. The runner stops it after that, rather than leaving the button
+  // stuck on "Switching…" forever.
+  LimitedProcess {
+    id: switchRun
+    label: "cswap-panel switch"
+    panelScript: usage.panelScript
+    environment: usage.closedEnv
+    timeoutSec: 180
+    maxOut: 65536
+    maxErr: 65536
+    onDone: (ok, exitCode, output) => {
       root.switchRunning = false
       usage.runCswapBridge()
       // The account you switched to is now the active Claude Code tab.
-      if (exitCode === 0) root.selectedProviderId = "claude"
-    }
-
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (text.trim() !== "") console.warn("agents", "cswap switch:", text.trim())
-    }
-  }
-
-  // A switch runs cswap and can wait on a login, so give it a generous limit
-  // and stop it if it hangs, rather than leaving the button stuck on
-  // "Switching…" forever.
-  Timer {
-    id: switchDeadline
-    interval: 180000
-    repeat: false
-    onTriggered: {
-      console.warn("agents", "cswap switch timed out; stopping it")
-      switchProcess.running = false
+      if (ok) root.selectedProviderId = "claude"
     }
   }
 
@@ -185,7 +164,7 @@ Panel {
   }
 
   function canAddAccount(p) {
-    return isClaudeTab(p) && usage.cswapState !== "missing" && usage.cswapPath !== ""
+    return isClaudeTab(p) && usage.cswapState !== "" && usage.cswapState !== "missing"
   }
 
   // The button shows on the active account's tab only; `a` works on every Claude tab.
@@ -197,14 +176,30 @@ Panel {
     return isClaudeTab(p) && (usage.cswapState === "missing" || usage.cswapState === "no-accounts")
   }
 
+  // The terminal runs the script through `env -i`, so the script starts with
+  // a closed environment too, whatever environment the terminal has. $0 is
+  // the script, $1 HOME, $2 XDG_RUNTIME_DIR, $3 WAYLAND_DISPLAY and $4
+  // CLAUDE_CONFIG_DIR, which is left out when it is empty.
+  readonly property string addAccountLauncher: 'exec /usr/bin/env -i HOME="$1" PATH=/usr/bin:/bin TERM="${TERM:-xterm-256color}" LANG=C.UTF-8 XDG_RUNTIME_DIR="$2" WAYLAND_DISPLAY="$3" ${4:+"CLAUDE_CONFIG_DIR=$4"} /usr/bin/bash -p "$0"'
+
   function addAccount() {
-    if (!canAddAccount(root.provider)) return
+    if (!canAddAccount(root.provider) || usage.home === "") return
     root.close()
-    Quickshell.execDetached(["omarchy", "launch", "terminal", "bash", root.addAccountScript, usage.cswapPath, usage.cswapBridge])
+    Quickshell.execDetached({
+      command: ["/usr/bin/omarchy", "launch", "terminal", "/usr/bin/bash", "-p", "-c", root.addAccountLauncher,
+                root.addAccountScript, usage.home, usage.closedEnv.XDG_RUNTIME_DIR || "",
+                usage.closedEnv.WAYLAND_DISPLAY || "", usage.closedEnv.CLAUDE_CONFIG_DIR || ""],
+      environment: usage.closedEnv,
+      clearEnvironment: true
+    })
   }
 
   function copyInstallCommand() {
-    Quickshell.execDetached(["wl-copy", root.installCommand])
+    Quickshell.execDetached({
+      command: ["/usr/bin/wl-copy", root.installCommand],
+      environment: usage.closedEnv,
+      clearEnvironment: true
+    })
     root.installCommandCopied = true
   }
 
@@ -409,14 +404,6 @@ Panel {
       + " · out " + usage.formatTokenCount(row.output)
       + " · cache read " + usage.formatTokenCount(row.cacheRead)
       + " · cache write " + usage.formatTokenCount(row.cacheWrite)
-  }
-
-  // Only speaks up when the numbers cover more than this machine.
-  function footerText() {
-    if (usage.syncStatusText !== "") return usage.syncStatusText
-    if (provider && provider.syncEnabled && provider.syncDeviceCount > 0)
-      return "Merged from " + provider.syncDeviceCount + " device" + (provider.syncDeviceCount === 1 ? "" : "s")
-    return ""
   }
 
   // Agents that ship a white mark carry an `assets/<id>-light.svg` twin for
@@ -944,19 +931,6 @@ Panel {
                 share: modelData.total / Math.max(1, root.models[0].total)
               }
             }
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            visible: text !== ""
-            width: parent.width
-            topPadding: Style.space(2)
-            text: root.footerText()
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            horizontalAlignment: Text.AlignHCenter
-            elide: Text.ElideRight
           }
         }
       }

@@ -1,29 +1,46 @@
-#!/usr/bin/env bash
-# Add Claude accounts to claude-swap. The panel opens this script in a terminal.
-# $1 = cswap binary (optional), $2 = bin/cswap-omarchy, to update the panel at the end.
+#!/usr/bin/bash -p
+# Add Claude accounts to claude-swap. The panel opens this script in a terminal
+# through `env -i`, so it starts with a closed environment: HOME, TERM, LANG,
+# XDG_RUNTIME_DIR, WAYLAND_DISPLAY, PATH=/usr/bin:/bin, and CLAUDE_CONFIG_DIR
+# if the shell has it. System tools run from absolute paths. claude and cswap
+# run from fixed places in the home directory only.
 set -uo pipefail
+PATH=/usr/bin:/bin
 
-# Put the standard system directories first on PATH, so a program in a
-# user-writable directory cannot stand in for a system tool such as pgrep or
-# python3. The rest of the inherited PATH still follows, so cswap and claude
-# are still found.
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+case ${HOME:-} in
+  /*) ;;
+  *) echo "HOME is not an absolute path."; exit 1 ;;
+esac
 
-cswap=${1:-}
-[ -x "$cswap" ] || cswap=$(command -v cswap || true)
-bridge=${2:-}
+panel=${BASH_SOURCE[0]%/*}/cswap-panel
+case $panel in
+  /*) ;;
+  *) echo "Start this script with its absolute path."; exit 1 ;;
+esac
 
-# A script in a new terminal does not load the shell profile, so also look
-# where the Claude Code installers put claude.
-claude=$(command -v claude || true)
-for candidate in "$HOME/.local/bin/claude" "${XDG_DATA_HOME:-$HOME/.local/share}/mise/shims/claude" "$HOME/.claude/local/claude"; do
-  [ -n "$claude" ] && break
-  [ -x "$candidate" ] && claude=$candidate
-done
+# Prints the first candidate that is an executable regular file (after
+# symlinks), owned by the user or root and not writable by group or others.
+# The candidate path itself runs, because mise shims need their own name.
+pick_binary() {
+  local candidate info mode owner
+  for candidate in "$@"; do
+    [[ -f $candidate && -x $candidate ]] || continue
+    info=$(/usr/bin/stat -L -c '%a %u' -- "$candidate" 2>/dev/null) || continue
+    read -r mode owner <<<"$info"
+    [[ $owner == "$EUID" || $owner == 0 ]] || continue
+    (( (8#$mode & 8#022) == 0 )) || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+cswap=$(pick_binary "$HOME/.local/bin/cswap" "$HOME/.local/share/uv/tools/claude-swap/bin/cswap")
+claude=$(pick_binary "$HOME/.local/bin/claude" "$HOME/.local/share/mise/shims/claude" "$HOME/.claude/local/claude")
 
 finish() {
   trap - INT
-  [ -n "$bridge" ] && python3 "$bridge" >/dev/null 2>&1
+  [[ -f $panel ]] && /usr/bin/python3 -I -B "$panel" bridge >/dev/null 2>&1
   echo
   read -r -p "Press Enter to close. " _
   exit "${1:-0}"
@@ -37,40 +54,40 @@ stop() {
 
 # Prints "email org-id" of the Claude Code login, or nothing when logged out.
 login_id() {
-  "$claude" auth status --json 2>/dev/null | python3 -c '
+  "$claude" auth status --json 2>/dev/null | /usr/bin/head -c 65536 | /usr/bin/python3 -I -B -c '
 import json, sys
 try:
   data = json.load(sys.stdin)
 except ValueError:
   sys.exit()
-if data.get("loggedIn") and data.get("email"):
-  print(data["email"], data.get("orgId") or "")
+if isinstance(data, dict) and data.get("loggedIn") and data.get("email"):
+  print(str(data["email"])[:200], str(data.get("orgId") or "")[:200])
 ' 2>/dev/null
 }
 
-[ -n "$cswap" ] || stop "claude-swap is not installed. Install it with: uv tool install claude-swap"
-[ -n "$claude" ] || stop "Claude Code (claude) is not installed."
+[[ -n $cswap ]] || stop "claude-swap is not installed. Install it with: uv tool install claude-swap"
+[[ -n $claude ]] || stop "Claude Code (claude) is not installed."
 
 before=$(login_id)
 before_email=${before%% *}
 
 echo "Add Claude accounts to claude-swap"
 echo
-if [ -n "$before" ]; then
+if [[ -n $before ]]; then
   echo "Claude Code uses $before_email now. claude-swap saves this account first."
 else
   echo "Claude Code is not logged in."
 fi
 echo "Then you log in with the account to add. The login opens in the browser."
 echo "If the browser is signed in to claude.ai with a different account, the login uses that account. Sign out there first."
-if pgrep -x claude >/dev/null; then
+if /usr/bin/pgrep -x claude >/dev/null; then
   echo
   echo "Claude Code is open. During the login, open sessions change to the new account."
 fi
 echo
 read -r -p "Press Enter to start, or Ctrl+C to stop. " _ || exit 0
 
-if [ -n "$before" ]; then
+if [[ -n $before ]]; then
   echo
   "$cswap" add || stop "claude-swap could not save $before_email. Nothing changed."
   echo
@@ -79,15 +96,15 @@ if [ -n "$before" ]; then
 fi
 
 back_hint=""
-[ -n "$before" ] && back_hint=" To go back to $before_email, run: cswap switch $before_email"
+[[ -n $before ]] && back_hint=" To go back to $before_email, run: cswap switch $before_email"
 trap 'stop "Stopped.$back_hint"' INT
 
 echo
 "$claude" auth login || stop "The login did not complete.$back_hint"
 after=$(login_id)
 after_email=${after%% *}
-[ -n "$after" ] || stop "Claude Code is not logged in.$back_hint"
-[ "$after" != "$before" ] || stop "The login used $before_email again. Sign out of claude.ai in the browser, then try again."
+[[ -n $after ]] || stop "Claude Code is not logged in.$back_hint"
+[[ $after != "$before" ]] || stop "The login used $before_email again. Sign out of claude.ai in the browser, then try again."
 
 echo
 "$cswap" add || stop "claude-swap could not save $after_email.$back_hint"
@@ -95,7 +112,7 @@ trap - INT
 echo
 echo "claude-swap saved $after_email."
 
-if [ -n "$before" ]; then
+if [[ -n $before ]]; then
   read -r -p "Switch Claude Code back to $before_email? [Y/n] " answer
   case "$answer" in
     [nN]*) echo "Claude Code keeps $after_email." ;;

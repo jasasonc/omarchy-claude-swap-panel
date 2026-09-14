@@ -29,7 +29,8 @@ Codex, Fireworks, and the other stock tabs stay the same.
   uv tool install claude-swap
   ```
 
-- `python3`.
+  The plugin looks for `cswap` only in `~/.local/bin` and in `~/.local/share/uv/tools/claude-swap/bin`.
+- Python 3 at `/usr/bin/python3`.
 
 ## Install
 
@@ -83,15 +84,24 @@ After a switch, a notification shows the result. Open Claude Code sessions use t
 
 ## Settings
 
-The plugin reads the usage of all accounts every 180 seconds. To change the interval, add `"cswapRefreshIntervalSec": 300` to the entry of the plugin in `~/.config/omarchy/shell.json`. The minimum is 60 seconds. The other settings are the same as in the Agents panel.
+The plugin reads the usage of all accounts every 180 seconds. To change the interval, add `"cswapRefreshIntervalSec": 300` to the entry of the plugin in `~/.config/omarchy/shell.json`. The minimum is 60 seconds. The other settings are the same as in the Agents panel, but the plugin has no synced aggregation from other machines.
 
 ## How it works
 
-- `bin/cswap-omarchy` runs `cswap list --json`. It writes one usage record for each inactive account to `~/.local/state/omarchy/agents/usage/cswap-<name>.json`. The panel shows each record as a tab.
+- `bin/cswap-panel bridge` runs `cswap list --json`. It writes one usage record for each inactive account to `~/.local/state/omarchy/agents/usage/cswap-<name>.json`. The panel shows each record as a tab.
 - The stock Claude collector writes the record of the active account. The plugin gives that tab the name of the active account, from `~/.local/state/cswap-omarchy/active.json`.
-- `bin/cswap-omarchy` also writes `~/.local/state/cswap-omarchy/status.json`. The panel reads the setup state from this file.
-- The plugin runs `bin/cswap-omarchy` when the shell starts, at the refresh interval, when the panel opens, and after a switch. claude-swap keeps its own usage cache, so the plugin sends no more usage requests than claude-swap does.
+- The bridge also writes `~/.local/state/cswap-omarchy/status.json`. The panel gets the setup state from this file.
+- The plugin runs the bridge when the shell starts, at the refresh interval, when the panel opens, and after a switch. claude-swap keeps its own usage cache, so the plugin sends no more usage requests than claude-swap does.
 - If claude-swap cannot read the usage of an account, the tab shows the cause, for example `Sign-in expired`, and the last known numbers.
+
+## Processes and files
+
+- Each process that the plugin starts has an absolute program path and a closed environment. The environment has only `PATH=/usr/bin:/bin`, `OMARCHY_PATH`, `HOME`, `LANG`, `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`, and `CLAUDE_CONFIG_DIR` and `CODEX_HOME` if they are set.
+- `bin/cswap-panel run` starts each automatic process in its own process group. It stops the group at a deadline or when the output is larger than a limit. It also stops the group when the process ends, and when the shell stops the runner.
+- `bin/cswap-panel state` reads the usage records and the claude-swap state. The panel does not read these files itself. It only watches `status.json` for changes. The reader opens each folder and file without following symlinks. It accepts only folders and files that the user owns, and folders that the group and other users cannot write to. It reads at most 64 records, 1 MiB for each record, and 2 MiB in total.
+- The bridge writes the files through the same folder checks. It writes a new file first, then renames it.
+- The usage update is the unchanged Omarchy command `/usr/bin/omarchy-agent-usage-update`.
+- The right-click on the bar icon starts `/usr/bin/omarchy-agent --pick`, the command of the Omarchy agent key. `uwsm-app` starts it as a user session service, so the agent gets the session environment.
 
 ## Update and remove
 
