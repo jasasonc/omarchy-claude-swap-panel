@@ -514,12 +514,14 @@ def check_program(path: str, interpreter: bool = False):
   return real, interpreter_real
 
 
-def find_user_binary(candidates, report=log):
+def find_user_binary(candidates, report=log, native_name=""):
   """The first candidate whose chain passes the checks, or None.
 
-  A missing candidate is skipped quietly. A rejected one is reported with the
-  reason. The candidate path itself runs, not the real path, because a mise
-  shim needs its own name.
+  With native_name, a candidate must also be an ELF program: a script could
+  start other programs by name, which the checks cannot follow. A missing
+  candidate is skipped quietly. A rejected one is reported with the reason.
+  The candidate path itself runs, not the real path, because a mise shim
+  needs its own name.
   """
   for candidate in candidates:
     try:
@@ -527,7 +529,9 @@ def find_user_binary(candidates, report=log):
     except OSError:
       continue
     try:
-      check_program(candidate)
+      _, interpreter = check_program(candidate)
+      if native_name and interpreter:
+        raise Rejected(f"{native_name} must be a native program, not a script")
     except Rejected as exc:
       report(f"skipped {candidate}: {exc}")
       continue
@@ -535,15 +539,16 @@ def find_user_binary(candidates, report=log):
   return None
 
 
-USER_TOOLS = {"cswap": CSWAP_CANDIDATES, "claude": CLAUDE_CANDIDATES}
+# name -> (candidates, name if only an ELF program is allowed)
+USER_TOOLS = {"cswap": (CSWAP_CANDIDATES, ""), "claude": (CLAUDE_CANDIDATES, "claude")}
 
 
 def cmd_resolve(args) -> int:
   if len(args) != 1 or args[0] not in USER_TOOLS:
     log("usage: cswap-panel resolve cswap|claude")
     return 2
-  candidates = USER_TOOLS[args[0]]
-  found = find_user_binary(candidates)
+  candidates, native_name = USER_TOOLS[args[0]]
+  found = find_user_binary(candidates, native_name=native_name)
   if not found:
     log(f"no usable {args[0]} found. Tried: {', '.join(candidates)}")
     return 1
