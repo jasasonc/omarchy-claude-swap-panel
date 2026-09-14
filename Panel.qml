@@ -72,19 +72,6 @@ Panel {
     usage.refreshAll(true)
   }
 
-  // The same command as the Omarchy agent key, started as a user session
-  // service through uwsm, as Omarchy starts its apps. The service gets the
-  // session environment from systemd, so the agent that the user picked is
-  // found; this process passes only the closed environment.
-  function launchAgent() {
-    Quickshell.execDetached({
-      command: ["/usr/bin/uwsm-app", "-t", "service", "--", "/usr/bin/omarchy-agent", "--pick"],
-      environment: usage.closedEnv,
-      clearEnvironment: true
-    })
-    root.close()
-  }
-
   // ------------------------------------------------------- claude-swap switch
   //
   // From the keyboard, switching needs two presses of `s` within 3 seconds,
@@ -215,8 +202,8 @@ Panel {
   // and a long weekly one. Everything below normalizes them into one record so
   // the meters and the hero speak a single language.
 
-  // Claude spells its windows out ("Session (5-hour)"), Codex abbreviates
-  // them ("5h window", "30m window"). Both have to land on the same record.
+  // Collectors spell windows out ("Session (5-hour)") or abbreviate them
+  // ("5h window", "30m window"). Both have to land on the same record.
   function windowIsLong(text) {
     return text.indexOf("week") >= 0 || text.indexOf("7-day") >= 0 || text.indexOf("seven") >= 0
       || text.indexOf("month") >= 0 || text.indexOf("30-day") >= 0
@@ -488,8 +475,9 @@ Panel {
     text: "󱚣"
     active: root.alarming
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) root.launchAgent()
-      else if (buttonCode === Qt.MiddleButton) root.selectProvider(root.providerIndex + 1)
+      // The right button does nothing.
+      if (buttonCode === Qt.RightButton) return
+      if (buttonCode === Qt.MiddleButton) root.selectProvider(root.providerIndex + 1)
       else root.toggle()
     }
   }

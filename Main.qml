@@ -28,8 +28,7 @@ Item {
       "HOME": absolutePath(Quickshell.env("HOME")),
       "XDG_RUNTIME_DIR": absolutePath(Quickshell.env("XDG_RUNTIME_DIR")),
       "WAYLAND_DISPLAY": plainToken(Quickshell.env("WAYLAND_DISPLAY")),
-      "CLAUDE_CONFIG_DIR": absolutePath(Quickshell.env("CLAUDE_CONFIG_DIR")),
-      "CODEX_HOME": absolutePath(Quickshell.env("CODEX_HOME"))
+      "CLAUDE_CONFIG_DIR": absolutePath(Quickshell.env("CLAUDE_CONFIG_DIR"))
     }
     for (var key in optional) {
       if (optional[key] !== "") env[key] = optional[key]
@@ -257,25 +256,34 @@ Item {
     }
   }
 
+  // This plugin shows Claude accounts and Fireworks. The dispatcher skips an
+  // excluded collector before it starts it, so the Codex collector never runs.
+  readonly property var excludedAgents: ["codex"]
+
+  function updateAgent(id) {
+    return validId(id) && excludedAgents.indexOf(String(id)) < 0
+  }
+
   function updateCommand(kind, agentIds) {
     var command = ["/usr/bin/omarchy-agent-usage-update"]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
+    for (var e = 0; e < excludedAgents.length; e++) command.push("--except", excludedAgents[e])
     var providers = settings && settings.providers ? settings.providers : {}
     for (var id in providers) {
-      if (providers[id] && providers[id].enabled === false && validId(id)) command.push("--except", id)
+      if (providers[id] && providers[id].enabled === false && updateAgent(id)) command.push("--except", id)
     }
     if (agentIds) {
       for (var i = 0; i < agentIds.length; i++) {
-        if (validId(agentIds[i])) command.push(String(agentIds[i]))
+        if (updateAgent(agentIds[i])) command.push(String(agentIds[i]))
       }
     }
     return command
   }
 
   function runUpdate(kind, agentIds) {
-    // A retry for named agents with no valid id left would run every collector.
-    if (agentIds && agentIds.filter(function(id) { return root.validId(id) }).length === 0) return
+    // A retry for named agents with no id left would run every collector.
+    if (agentIds && agentIds.filter(function(id) { return root.updateAgent(id) }).length === 0) return
     if (updateRun.running) {
       // Collapse queued requests to one full rerun; a forced refresh outranks
       // the cheaper kinds it might have been queued behind.

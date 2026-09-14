@@ -3,7 +3,8 @@
 # through `env -i`, so it starts with a closed environment: HOME, TERM, LANG,
 # XDG_RUNTIME_DIR, WAYLAND_DISPLAY, PATH=/usr/bin:/bin, and CLAUDE_CONFIG_DIR
 # if the shell has it. System tools run from absolute paths. claude and cswap
-# run from fixed places in the home directory only.
+# run only from fixed places in the home directory, after the checks of
+# `cswap-panel resolve`.
 set -uo pipefail
 PATH=/usr/bin:/bin
 
@@ -18,25 +19,15 @@ case $panel in
   *) echo "Start this script with its absolute path."; exit 1 ;;
 esac
 
-# Prints the first candidate that is an executable regular file (after
-# symlinks), owned by the user or root and not writable by group or others.
-# The candidate path itself runs, because mise shims need their own name.
-pick_binary() {
-  local candidate info mode owner
-  for candidate in "$@"; do
-    [[ -f $candidate && -x $candidate ]] || continue
-    info=$(/usr/bin/stat -L -c '%a %u' -- "$candidate" 2>/dev/null) || continue
-    read -r mode owner <<<"$info"
-    [[ $owner == "$EUID" || $owner == 0 ]] || continue
-    (( (8#$mode & 8#022) == 0 )) || continue
-    printf '%s\n' "$candidate"
-    return 0
-  done
-  return 1
+# cswap-panel tries only fixed candidates. It checks every folder and symlink
+# on the way, the program file and its #! interpreter, and prints the path to
+# run. Here its reasons are hidden; they show below if nothing passes.
+resolve() {
+  /usr/bin/python3 -I -B "$panel" resolve "$1" 2>/dev/null
 }
 
-cswap=$(pick_binary "$HOME/.local/bin/cswap" "$HOME/.local/share/uv/tools/claude-swap/bin/cswap")
-claude=$(pick_binary "$HOME/.local/bin/claude" "$HOME/.local/share/mise/shims/claude" "$HOME/.claude/local/claude")
+cswap=$(resolve cswap)
+claude=$(resolve claude)
 
 finish() {
   trap - INT
@@ -65,8 +56,14 @@ if isinstance(data, dict) and data.get("loggedIn") and data.get("email"):
 ' 2>/dev/null
 }
 
-[[ -n $cswap ]] || stop "claude-swap is not installed. Install it with: uv tool install claude-swap"
-[[ -n $claude ]] || stop "Claude Code (claude) is not installed."
+if [[ -z $cswap ]]; then
+  /usr/bin/python3 -I -B "$panel" resolve cswap >/dev/null
+  stop "claude-swap is not installed, or it failed the checks above. To install it, run: uv tool install claude-swap"
+fi
+if [[ -z $claude ]]; then
+  /usr/bin/python3 -I -B "$panel" resolve claude >/dev/null
+  stop "Claude Code (claude) is not installed, or it failed the checks above."
+fi
 
 before=$(login_id)
 before_email=${before%% *}

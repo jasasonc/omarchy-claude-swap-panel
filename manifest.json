@@ -20,7 +20,6 @@
     "defaults": {
       "providers": {
         "claude": { "enabled": true },
-        "codex": { "enabled": true },
         "fireworks": { "enabled": true }
       },
       "refreshIntervalSec": 900,

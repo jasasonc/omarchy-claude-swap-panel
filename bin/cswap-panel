@@ -13,6 +13,8 @@ closed environment. Subcommands:
       Run `cswap list --json` and write one usage record per inactive account.
   switch NUMBER NAME
       Switch Claude Code to a claude-swap account and show the result.
+  resolve cswap|claude
+      Print the first fixed candidate path whose chain passes the checks.
 
 State lives in fixed folders under the home directory from the password
 database, not from the environment. Each folder is opened one component at a
@@ -47,17 +49,31 @@ ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,79}")
 ACCOUNT_FILE_RE = re.compile(r"cswap-[a-z0-9][a-z0-9-]{0,79}\.json")
 
 # The only variables a child process gets. PATH is always the system PATH.
-ENV_KEYS = ("OMARCHY_PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "CLAUDE_CONFIG_DIR", "CODEX_HOME")
+ENV_KEYS = ("OMARCHY_PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "CLAUDE_CONFIG_DIR")
 SYSTEM_PATH = "/usr/bin:/bin"
 
 USAGE_UPDATE = "/usr/bin/omarchy-agent-usage-update"
 NOTIFY_SEND = "/usr/bin/notify-send"
 
-# User tools live in the user's home. Only these fixed paths are tried.
+# User tools live in the user's home. Only these fixed paths are tried, in
+# this order (see find_user_binary).
 CSWAP_CANDIDATES = (
   os.path.join(HOME_DIR, ".local/bin/cswap"),
   os.path.join(HOME_DIR, ".local/share/uv/tools/claude-swap/bin/cswap"),
 )
+CLAUDE_CANDIDATES = (
+  os.path.join(HOME_DIR, ".local/share/mise/installs/claude/latest/claude"),
+  os.path.join(HOME_DIR, ".local/bin/claude"),
+  os.path.join(HOME_DIR, ".local/share/mise/shims/claude"),
+  os.path.join(HOME_DIR, ".claude/local/claude"),
+)
+MAX_HOPS = 8
+SHEBANG_BYTES = 256
+
+# This plugin shows Claude accounts and Fireworks. The Codex record in the
+# shared usage folder belongs to Omarchy; the plugin skips it and never runs
+# its collector.
+EXCLUDED_AGENTS = ("codex",)
 
 # Limits for the state reader.
 MAX_RECORD_BYTES = 1024 * 1024
@@ -338,6 +354,8 @@ def read_records(dir_fd: int, problems: list) -> dict:
   for name in list_names(dir_fd, problems):
     if not name.endswith(".json") or name.startswith("."):
       continue
+    if name[:-5] in EXCLUDED_AGENTS:
+      continue
     if not ID_RE.fullmatch(name[:-5]):
       problems.append(f"skipped {ascii(name)[:100]}: the name is not a valid record id")
       continue
@@ -376,25 +394,163 @@ def read_records(dir_fd: int, problems: list) -> dict:
 
 
 # ------------------------------------------------------------ user tools
+#
+# cswap and claude live in the home folder. Only the fixed candidates below
+# are tried, and a candidate runs only if the whole chain passes the checks:
+# every directory on the way from / (also through each symlink), the program
+# file, and the #! interpreter of a script with its own chain.
 
 
-def find_user_binary(candidates):
-  """The first candidate that is an executable regular file, owned by the
-  user or root and not writable by group or others. Symlinks are followed
-  for the check (uv links ~/.local/bin/cswap into its tool folder), but the
-  candidate path itself is what runs.
+class Rejected(Exception):
+  pass
+
+
+def check_directory(path: str, st) -> None:
+  if not stat.S_ISDIR(st.st_mode):
+    raise Rejected(f"{path} is not a directory")
+  if st.st_uid not in (0, UID):
+    raise Rejected(f"{path} is not owned by root or the user")
+  if st.st_mode & 0o022:
+    raise Rejected(f"{path} is writable by group or others")
+
+
+def resolve_path(path: str) -> str:
+  """Resolve every symlink in path by hand and return the real path.
+
+  Each directory on the way is checked with lstat, from / down, also the
+  directories that a symlink leads into. At most MAX_HOPS symlinks are
+  followed. The real path is not checked here.
   """
-  for path in candidates:
+  if not path.startswith("/"):
+    raise Rejected(f"{path} is not an absolute path")
+  try:
+    check_directory("/", os.lstat("/"))
+  except OSError as exc:
+    raise Rejected(f"/: {exc.strerror}")
+  pending = [part for part in reversed(path.split("/")) if part]
+  real = []
+  hops = 0
+  while pending:
+    part = pending.pop()
+    if part == ".":
+      continue
+    if part == "..":
+      # Only a checked real directory is on the stack, so this is what the
+      # kernel does too.
+      if real:
+        real.pop()
+      continue
+    current = "/" + "/".join(real + [part])
     try:
-      st = os.stat(path)
+      st = os.lstat(current)
+    except OSError as exc:
+      raise Rejected(f"{current}: {exc.strerror}")
+    if stat.S_ISLNK(st.st_mode):
+      hops += 1
+      if hops > MAX_HOPS:
+        raise Rejected(f"{path} has more than {MAX_HOPS} symlinks")
+      try:
+        target = os.readlink(current)
+      except OSError as exc:
+        raise Rejected(f"{current}: {exc.strerror}")
+      if target.startswith("/"):
+        real = []
+      pending.extend(item for item in reversed(target.split("/")) if item)
+      continue
+    real.append(part)
+    if pending:
+      check_directory(current, st)
+  if not real:
+    raise Rejected(f"{path} does not name a file")
+  return "/" + "/".join(real)
+
+
+def check_program(path: str, interpreter: bool = False):
+  """Check one program and return (real path, real interpreter or None)."""
+  real = resolve_path(path)
+  try:
+    st = os.lstat(real)
+  except OSError as exc:
+    raise Rejected(f"{real}: {exc.strerror}")
+  if not stat.S_ISREG(st.st_mode):
+    raise Rejected(f"{real} is not a regular file")
+  if st.st_uid not in (0, UID):
+    raise Rejected(f"{real} is not owned by root or the user")
+  if st.st_mode & 0o022:
+    raise Rejected(f"{real} is writable by group or others")
+  if not os.access(real, os.X_OK):
+    raise Rejected(f"{real} is not executable")
+  try:
+    fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+    try:
+      head = os.read(fd, SHEBANG_BYTES)
+    finally:
+      os.close(fd)
+  except OSError as exc:
+    raise Rejected(f"{real}: {exc.strerror}")
+
+  if head.startswith(b"\x7fELF"):
+    return real, None
+  if not head.startswith(b"#!"):
+    raise Rejected(f"{real} is not an ELF program or a script with #!")
+  if interpreter:
+    raise Rejected(f"the interpreter {real} is a script, not an ELF program")
+  line, newline, _ = head[2:].partition(b"\n")
+  if not newline:
+    raise Rejected(f"the #! line of {real} is longer than {SHEBANG_BYTES} bytes")
+  words = line.decode("utf-8", "replace").split()
+  if not words:
+    raise Rejected(f"the #! line of {real} is empty")
+  if not words[0].startswith("/"):
+    raise Rejected(f"the #! interpreter of {real} is not an absolute path: {words[0][:80]}")
+  if os.path.basename(words[0]) == "env":
+    raise Rejected(f"the #! line of {real} uses env, which searches PATH")
+  try:
+    interpreter_real, _ = check_program(words[0], interpreter=True)
+  except Rejected as exc:
+    raise Rejected(f"the #! interpreter of {real} failed: {exc}")
+  if os.path.basename(interpreter_real) == "env":
+    raise Rejected(f"the #! line of {real} uses env, which searches PATH")
+  return real, interpreter_real
+
+
+def find_user_binary(candidates, report=log):
+  """The first candidate whose chain passes the checks, or None.
+
+  A missing candidate is skipped quietly. A rejected one is reported with the
+  reason. The candidate path itself runs, not the real path, because a mise
+  shim needs its own name.
+  """
+  for candidate in candidates:
+    try:
+      os.lstat(candidate)
     except OSError:
       continue
-    if not stat.S_ISREG(st.st_mode) or st.st_uid not in (UID, 0):
+    try:
+      check_program(candidate)
+    except Rejected as exc:
+      report(f"skipped {candidate}: {exc}")
       continue
-    if st.st_mode & 0o022 or not os.access(path, os.X_OK):
-      continue
-    return path
+    return candidate
   return None
+
+
+USER_TOOLS = {"cswap": CSWAP_CANDIDATES, "claude": CLAUDE_CANDIDATES}
+
+
+def cmd_resolve(args) -> int:
+  if len(args) != 1 or args[0] not in USER_TOOLS:
+    log("usage: cswap-panel resolve cswap|claude")
+    return 2
+  candidates = USER_TOOLS[args[0]]
+  found = find_user_binary(candidates)
+  if not found:
+    log(f"no usable {args[0]} found. Tried: {', '.join(candidates)}")
+    return 1
+  real, interpreter = check_program(found)
+  log(f"{args[0]}: {found} -> {real}" + (f", interpreter {interpreter}" if interpreter else ""))
+  print(found)
+  return 0
 
 
 class CommandFailed(Exception):
@@ -1084,12 +1240,12 @@ def cmd_run(args) -> int:
 # ------------------------------------------------------------------- main
 
 
-COMMANDS = {"run": cmd_run, "state": cmd_state, "bridge": cmd_bridge, "switch": cmd_switch}
+COMMANDS = {"run": cmd_run, "state": cmd_state, "bridge": cmd_bridge, "switch": cmd_switch, "resolve": cmd_resolve}
 
 
 def main(argv) -> int:
   if not argv or argv[0] not in COMMANDS:
-    log("usage: cswap-panel run|state|bridge|switch ...")
+    log("usage: cswap-panel run|state|bridge|switch|resolve ...")
     return 2
   return COMMANDS[argv[0]](argv[1:])
 
