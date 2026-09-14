@@ -96,12 +96,13 @@ The plugin reads the usage of all accounts every 180 seconds. To change the inte
 
 ## Processes and files
 
-- Each process that the plugin starts has an absolute program path and a closed environment. The environment has only `PATH=/usr/bin:/bin`, `OMARCHY_PATH`, `HOME`, `LANG`, `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`, and `CLAUDE_CONFIG_DIR` if it is set.
+- Each process that the plugin starts directly has an absolute program path and a closed environment. The Add account terminal starts through Omarchy and the session, so the plugin cannot close the environment of the terminal itself. The terminal runs `env -i`, and the script starts with a closed environment again. The environment has only `PATH=/usr/bin:/bin`, `OMARCHY_PATH`, `HOME`, `LANG`, `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`, and `CLAUDE_CONFIG_DIR` if it is set.
 - `bin/cswap-panel run` starts each automatic process in its own process group. At a deadline, or when the output is larger than a limit, it stops the process and all processes that it started, also the processes that left the group. It also stops them when the process ends, and when the shell stops the runner.
 - `bin/cswap-panel state` reads the usage records and the claude-swap state. The panel does not read these files itself. It only watches `status.json` for changes. The reader opens each folder and file without following symlinks. It accepts only folders and files that the user owns, and folders that the group and other users cannot write to. It reads at most 64 records, 1 MiB for each record, and 2 MiB in total.
 - The bridge writes the files through the same folder checks. It writes a new file first, then renames it.
 - The usage update is the unchanged Omarchy command `/usr/bin/omarchy-agent-usage-update`.
 - Before the plugin runs `cswap` or `claude`, `bin/cswap-panel` checks the program. It follows each symlink itself, at most 8. Each folder on the way, from `/` down, must be owned by root or the user and not writable by group or others. The program must be a regular file with the same owner and write rules. `claude` must be an ELF program. A `cswap` script must have an absolute `#!` interpreter that is not `env`, and the interpreter must pass the same checks and be an ELF program. If a candidate fails, the plugin writes the reason and tries the next candidate.
+- The program then starts through the file descriptor that passed the checks, not through its name. A script starts through the descriptor of its checked interpreter, and the interpreter reads the script from a descriptor. Thus the program that runs is the file that passed the checks.
 - The usage update always skips the Codex collector, and `bin/cswap-panel state` ignores the Codex record.
 
 ## Update and remove

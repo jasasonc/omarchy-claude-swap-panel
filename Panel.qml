@@ -107,9 +107,10 @@ Panel {
     if (!canSwitch(p) || root.switchRunning) return
     root.switchArmed = false
     // `cswap-panel switch` runs cswap switch, shows the result with
-    // notify-send, and updates the record of the active account.
+    // notify-send, and updates the record of the active account. It gets the
+    // account number only; it reads the name from the account files itself.
     root.switchRunning = switchRun.start(usage.panelCommand.concat(
-      ["switch", String(Number(p.cswapNumber)), String(p.providerName || "")]))
+      ["switch", String(Number(p.cswapNumber))]))
   }
 
   Timer {
@@ -163,19 +164,25 @@ Panel {
     return isClaudeTab(p) && (usage.cswapState === "missing" || usage.cswapState === "no-accounts")
   }
 
-  // The terminal runs the script through `env -i`, so the script starts with
-  // a closed environment too, whatever environment the terminal has. $0 is
-  // the script, $1 HOME, $2 XDG_RUNTIME_DIR, $3 WAYLAND_DISPLAY and $4
-  // CLAUDE_CONFIG_DIR, which is left out when it is empty.
-  readonly property string addAccountLauncher: 'exec /usr/bin/env -i HOME="$1" PATH=/usr/bin:/bin TERM="${TERM:-xterm-256color}" LANG=C.UTF-8 XDG_RUNTIME_DIR="$2" WAYLAND_DISPLAY="$3" ${4:+"CLAUDE_CONFIG_DIR=$4"} /usr/bin/bash -p "$0"'
+  // The terminal runs `env -i` itself, with no shell before it, so the
+  // script starts with a closed environment whatever environment the
+  // terminal has. The plugin cannot close the environment of the terminal
+  // itself: `omarchy launch terminal` gives that start to the session.
+  function addAccountCommand() {
+    var command = ["/usr/bin/omarchy", "launch", "terminal", "/usr/bin/env", "-i",
+                   "HOME=" + usage.home, "PATH=/usr/bin:/bin", "TERM=xterm-256color", "LANG=C.UTF-8"]
+    if (usage.closedEnv.XDG_RUNTIME_DIR) command.push("XDG_RUNTIME_DIR=" + usage.closedEnv.XDG_RUNTIME_DIR)
+    if (usage.closedEnv.WAYLAND_DISPLAY) command.push("WAYLAND_DISPLAY=" + usage.closedEnv.WAYLAND_DISPLAY)
+    if (usage.closedEnv.CLAUDE_CONFIG_DIR) command.push("CLAUDE_CONFIG_DIR=" + usage.closedEnv.CLAUDE_CONFIG_DIR)
+    command.push("/usr/bin/bash", "-p", root.addAccountScript)
+    return command
+  }
 
   function addAccount() {
     if (!canAddAccount(root.provider) || usage.home === "") return
     root.close()
     Quickshell.execDetached({
-      command: ["/usr/bin/omarchy", "launch", "terminal", "/usr/bin/bash", "-p", "-c", root.addAccountLauncher,
-                root.addAccountScript, usage.home, usage.closedEnv.XDG_RUNTIME_DIR || "",
-                usage.closedEnv.WAYLAND_DISPLAY || "", usage.closedEnv.CLAUDE_CONFIG_DIR || ""],
+      command: root.addAccountCommand(),
       environment: usage.closedEnv,
       clearEnvironment: true
     })

@@ -27,7 +27,8 @@ Item {
   // ok is true only for a normal exit with code 0, inside the limits.
   signal done(bool ok, int exitCode, string output)
 
-  property string outText: ""
+  property var outChunks: []
+  property int outLength: 0
   property string errText: ""
   property bool failed: false
   property bool exitSeen: true
@@ -40,7 +41,8 @@ Item {
     if (busy || process.running || panelScript.charAt(0) !== "/" || !target || target.length === 0
         || String(target[0]).charAt(0) !== "/")
       return false
-    outText = ""
+    outChunks = []
+    outLength = 0
     errText = ""
     failed = false
     exitSeen = false
@@ -54,16 +56,22 @@ Item {
     return true
   }
 
+  // Chunks go into an array and are joined once, at the end. A growing
+  // string would copy everything again for every chunk.
   function take(data, isOut) {
     if (failed) return
     var chunk = String(data)
-    var current = isOut ? outText : errText
-    if (current.length + chunk.length > (isOut ? maxOut : maxErr)) {
+    var length = isOut ? outLength : errText.length
+    if (length + chunk.length > (isOut ? maxOut : maxErr)) {
       stopAfterFailure((isOut ? "stdout" : "stderr") + " passed its limit")
       return
     }
-    if (isOut) outText = current + chunk
-    else errText = current + chunk
+    if (isOut) {
+      outChunks.push(chunk)
+      outLength += chunk.length
+    } else {
+      errText += chunk
+    }
   }
 
   function stopAfterFailure(reason) {
@@ -78,8 +86,9 @@ Item {
     killTimer.stop()
     resultOk = ok
     resultCode = code
-    resultOutput = ok ? outText : ""
-    outText = ""
+    resultOutput = ok ? outChunks.join("") : ""
+    outChunks = []
+    outLength = 0
     // Report after the Process has finished its own exit handling, so a
     // handler can start the next run at once.
     report.restart()

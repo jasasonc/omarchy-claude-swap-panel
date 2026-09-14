@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jasasonc.claude-swap-panel",
   "name": "Claude Swap Panel",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Jaša Sonc",
   "license": "MIT",
   "description": "The Agents panel with a tab for each claude-swap account: usage limits per account, and a keyboard-first switch between accounts. Unofficial, not part of claude-swap.",

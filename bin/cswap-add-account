@@ -20,10 +20,16 @@ case $panel in
 esac
 
 # cswap-panel tries only fixed candidates. It checks every folder and symlink
-# on the way, the program file and its #! interpreter, and prints the path to
-# run. Here its reasons are hidden; they show below if nothing passes.
+# on the way, the program file and its #! interpreter. `resolve` prints the
+# path; its reasons are hidden here and show below if nothing passes. `run`
+# starts the program through the descriptor that passed the checks, so a
+# name cannot point somewhere else between the check and the start.
 resolve() {
   /usr/bin/python3 -I -B "$panel" resolve "$1" 2>/dev/null
+}
+
+run() {
+  /usr/bin/python3 -I -B "$panel" exec "$@"
 }
 
 cswap=$(resolve cswap)
@@ -31,7 +37,8 @@ claude=$(resolve claude)
 
 finish() {
   trap - INT
-  [[ -f $panel ]] && /usr/bin/python3 -I -B "$panel" bridge >/dev/null 2>&1
+  [[ -f $panel ]] && /usr/bin/python3 -I -B "$panel" run --timeout 150 --max-out 65536 --max-err 65536 \
+    -- /usr/bin/python3 -I -B "$panel" bridge >/dev/null 2>&1
   echo
   read -r -p "Press Enter to close. " _
   exit "${1:-0}"
@@ -45,7 +52,7 @@ stop() {
 
 # Prints "email org-id" of the Claude Code login, or nothing when logged out.
 login_id() {
-  "$claude" auth status --json 2>/dev/null | /usr/bin/head -c 65536 | /usr/bin/python3 -I -B -c '
+  run claude auth status --json 2>/dev/null | /usr/bin/head -c 65536 | /usr/bin/python3 -I -B -c '
 import json, sys
 try:
   data = json.load(sys.stdin)
@@ -86,7 +93,7 @@ read -r -p "Press Enter to start, or Ctrl+C to stop. " _ || exit 0
 
 if [[ -n $before ]]; then
   echo
-  "$cswap" add || stop "claude-swap could not save $before_email. Nothing changed."
+  run cswap add || stop "claude-swap could not save $before_email. Nothing changed."
   echo
   read -r -p "Log in with another account now? [Y/n] " answer
   case "$answer" in [nN]*) finish ;; esac
@@ -97,14 +104,14 @@ back_hint=""
 trap 'stop "Stopped.$back_hint"' INT
 
 echo
-"$claude" auth login || stop "The login did not complete.$back_hint"
+run claude auth login || stop "The login did not complete.$back_hint"
 after=$(login_id)
 after_email=${after%% *}
 [[ -n $after ]] || stop "Claude Code is not logged in.$back_hint"
 [[ $after != "$before" ]] || stop "The login used $before_email again. Sign out of claude.ai in the browser, then try again."
 
 echo
-"$cswap" add || stop "claude-swap could not save $after_email.$back_hint"
+run cswap add || stop "claude-swap could not save $after_email.$back_hint"
 trap - INT
 echo
 echo "claude-swap saved $after_email."
@@ -113,7 +120,7 @@ if [[ -n $before ]]; then
   read -r -p "Switch Claude Code back to $before_email? [Y/n] " answer
   case "$answer" in
     [nN]*) echo "Claude Code keeps $after_email." ;;
-    *) "$cswap" switch "$before_email" || echo "The switch failed. Run: cswap switch $before_email" ;;
+    *) run cswap switch "$before_email" || echo "The switch failed. Run: cswap switch $before_email" ;;
   esac
 fi
 finish

@@ -15,6 +15,9 @@ closed environment. Subcommands:
       Switch Claude Code to a claude-swap account and show the result.
   resolve cswap|claude
       Print the first fixed candidate path whose chain passes the checks.
+  exec cswap|claude [argument...]
+      Start that program in place of this process, through the descriptor
+      that passed the checks.
 
 State lives in fixed folders under the home directory from the password
 database, not from the environment. Each folder is opened one component at a
@@ -98,6 +101,8 @@ EXIT_DEADLINE = 200
 EXIT_CAP = 201
 EXIT_RUNNER = 202
 KILL_GRACE = 2.0
+SWEEP_SECONDS = 1.0
+CHILDREN_FILE_REPORTED = []
 CHUNK = 4096
 PR_SET_PDEATHSIG = 1
 PR_SET_CHILD_SUBREAPER = 36
@@ -464,63 +469,115 @@ def resolve_path(path: str) -> str:
   return "/" + "/".join(real)
 
 
-def check_program(path: str, interpreter: bool = False):
-  """Check one program and return (real path, real interpreter or None)."""
+def is_executable(st) -> bool:
+  if st.st_uid == UID:
+    return bool(st.st_mode & 0o100)
+  if st.st_gid in os.getgroups():
+    return bool(st.st_mode & 0o010)
+  return bool(st.st_mode & 0o001)
+
+
+def check_program(path: str, interpreter: bool = False) -> dict:
+  """Check one program and keep the descriptor of the file that passed.
+
+  Returns {"real", "fd", "interpreter", "interpreter_name", "interpreter_fd",
+  "shebang_arg"}. The descriptors stay open, so the program that runs is the
+  object that passed the checks, not a name that something can change after
+  the check. Close them with close_program.
+  """
   real = resolve_path(path)
   try:
-    st = os.lstat(real)
-  except OSError as exc:
-    raise Rejected(f"{real}: {exc.strerror}")
-  if not stat.S_ISREG(st.st_mode):
-    raise Rejected(f"{real} is not a regular file")
-  if st.st_uid not in (0, UID):
-    raise Rejected(f"{real} is not owned by root or the user")
-  if st.st_mode & 0o022:
-    raise Rejected(f"{real} is writable by group or others")
-  if not os.access(real, os.X_OK):
-    raise Rejected(f"{real} is not executable")
-  try:
     fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
-    try:
-      head = os.read(fd, SHEBANG_BYTES)
-    finally:
-      os.close(fd)
   except OSError as exc:
-    raise Rejected(f"{real}: {exc.strerror}")
-
-  if head.startswith(b"\x7fELF"):
-    return real, None
-  if not head.startswith(b"#!"):
-    raise Rejected(f"{real} is not an ELF program or a script with #!")
-  if interpreter:
-    raise Rejected(f"the interpreter {real} is a script, not an ELF program")
-  line, newline, _ = head[2:].partition(b"\n")
-  if not newline:
-    raise Rejected(f"the #! line of {real} is longer than {SHEBANG_BYTES} bytes")
-  words = line.decode("utf-8", "replace").split()
-  if not words:
-    raise Rejected(f"the #! line of {real} is empty")
-  if not words[0].startswith("/"):
-    raise Rejected(f"the #! interpreter of {real} is not an absolute path: {words[0][:80]}")
-  if os.path.basename(words[0]) == "env":
-    raise Rejected(f"the #! line of {real} uses env, which searches PATH")
+    raise Rejected(f"{real}: {reason(exc)}")
+  info = {"real": real, "fd": fd, "interpreter": None, "interpreter_name": "",
+          "interpreter_fd": None, "shebang_arg": ""}
   try:
-    interpreter_real, _ = check_program(words[0], interpreter=True)
-  except Rejected as exc:
-    raise Rejected(f"the #! interpreter of {real} failed: {exc}")
-  if os.path.basename(interpreter_real) == "env":
-    raise Rejected(f"the #! line of {real} uses env, which searches PATH")
-  return real, interpreter_real
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+      raise Rejected(f"{real} is not a regular file")
+    if st.st_uid not in (0, UID):
+      raise Rejected(f"{real} is not owned by root or the user")
+    if st.st_mode & 0o022:
+      raise Rejected(f"{real} is writable by group or others")
+    if not is_executable(st):
+      raise Rejected(f"{real} is not executable")
+    # The descriptor must be the file that the checked path names.
+    path_st = os.lstat(real)
+    if (path_st.st_dev, path_st.st_ino) != (st.st_dev, st.st_ino):
+      raise Rejected(f"{real} changed while it was checked")
+    head = os.read(fd, SHEBANG_BYTES)
+
+    if head.startswith(b"\x7fELF"):
+      return info
+    if not head.startswith(b"#!"):
+      raise Rejected(f"{real} is not an ELF program or a script with #!")
+    if interpreter:
+      raise Rejected(f"the interpreter {real} is a script, not an ELF program")
+    line, newline, _ = head[2:].partition(b"\n")
+    if not newline:
+      raise Rejected(f"the #! line of {real} is longer than {SHEBANG_BYTES} bytes")
+    words = line.decode("utf-8", "replace").split()
+    if not words:
+      raise Rejected(f"the #! line of {real} is empty")
+    if not words[0].startswith("/"):
+      raise Rejected(f"the #! interpreter of {real} is not an absolute path: {words[0][:80]}")
+    if os.path.basename(words[0]) == "env":
+      raise Rejected(f"the #! line of {real} uses env, which searches PATH")
+    try:
+      interpreter_info = check_program(words[0], interpreter=True)
+    except Rejected as exc:
+      raise Rejected(f"the #! interpreter of {real} failed: {exc}")
+    if os.path.basename(interpreter_info["real"]) == "env":
+      close_program(interpreter_info)
+      raise Rejected(f"the #! line of {real} uses env, which searches PATH")
+    info["interpreter"] = interpreter_info["real"]
+    info["interpreter_fd"] = interpreter_info["fd"]
+    # The kernel starts the interpreter under the name in the #! line and
+    # gives it the rest of that line as one argument. Python finds the
+    # settings of a virtual environment next to that name, so keep it.
+    info["interpreter_name"] = words[0]
+    if len(words) > 1:
+      info["shebang_arg"] = " ".join(words[1:])
+    return info
+  except BaseException:
+    close_program(info)
+    raise
 
 
-def find_user_binary(candidates, report=log, native_name=""):
-  """The first candidate whose chain passes the checks, or None.
+def close_program(info: dict) -> None:
+  for key in ("fd", "interpreter_fd"):
+    if info.get(key) is not None:
+      try:
+        os.close(info[key])
+      except OSError:
+        pass
+      info[key] = None
+
+
+def program_command(info: dict, candidate: str, args):
+  """(program to start, argv, descriptors to keep open).
+
+  The program is a descriptor, not a name: /proc/self/fd/N is the file that
+  passed the checks. A script starts through the descriptor of its checked
+  interpreter, and the interpreter reads the script from its descriptor.
+  """
+  if info["interpreter_fd"] is not None:
+    argv = [info["interpreter_name"]]
+    if info["shebang_arg"]:
+      argv.append(info["shebang_arg"])
+    argv.append(f"/proc/self/fd/{info['fd']}")
+    argv.extend(args)
+    return f"/proc/self/fd/{info['interpreter_fd']}", argv, (info["interpreter_fd"], info["fd"])
+  return f"/proc/self/fd/{info['fd']}", [candidate] + list(args), (info["fd"],)
+
+
+def open_user_binary(candidates, report=log, native_name=""):
+  """(candidate, checked program) for the first candidate that passes, or None.
 
   With native_name, a candidate must also be an ELF program: a script could
   start other programs by name, which the checks cannot follow. A missing
   candidate is skipped quietly. A rejected one is reported with the reason.
-  The candidate path itself runs, not the real path, because a mise shim
-  needs its own name.
   """
   for candidate in candidates:
     try:
@@ -528,14 +585,26 @@ def find_user_binary(candidates, report=log, native_name=""):
     except OSError:
       continue
     try:
-      _, interpreter = check_program(candidate)
-      if native_name and interpreter:
-        raise Rejected(f"{native_name} must be a native program, not a script")
+      info = check_program(candidate)
     except Rejected as exc:
       report(f"skipped {candidate}: {exc}")
       continue
-    return candidate
+    if native_name and info["interpreter_fd"] is not None:
+      close_program(info)
+      report(f"skipped {candidate}: {native_name} must be a native program, not a script")
+      continue
+    return candidate, info
   return None
+
+
+def find_user_binary(candidates, report=log, native_name=""):
+  """The path of the first candidate that passes, or None. For a report only:
+  a caller that starts the program must use open_user_binary."""
+  found = open_user_binary(candidates, report=report, native_name=native_name)
+  if not found:
+    return None
+  close_program(found[1])
+  return found[0]
 
 
 # name -> (candidates, name if only an ELF program is allowed)
@@ -547,33 +616,70 @@ def cmd_resolve(args) -> int:
     log("usage: cswap-panel resolve cswap|claude")
     return 2
   candidates, native_name = USER_TOOLS[args[0]]
-  found = find_user_binary(candidates, native_name=native_name)
+  found = open_user_binary(candidates, native_name=native_name)
   if not found:
     log(f"no usable {args[0]} found. Tried: {', '.join(candidates)}")
     return 1
-  real, interpreter = check_program(found)
-  log(f"{args[0]}: {found} -> {real}" + (f", interpreter {interpreter}" if interpreter else ""))
-  print(found)
+  candidate, info = found
+  interpreter = f", interpreter {info['interpreter']}" if info["interpreter"] else ""
+  log(f"{args[0]}: {candidate} -> {info['real']}{interpreter}")
+  close_program(info)
+  print(candidate)
   return 0
+
+
+def cmd_exec(args) -> int:
+  """Start a checked program in place of this process, with its descriptor."""
+  if not args or args[0] not in USER_TOOLS:
+    log("usage: cswap-panel exec cswap|claude [argument...]")
+    return 2
+  name = args[0]
+  candidates, native_name = USER_TOOLS[name]
+  found = open_user_binary(candidates, native_name=native_name)
+  if not found:
+    log(f"no usable {name} found. Tried: {', '.join(candidates)}")
+    return 127
+  candidate, info = found
+  program, argv, fds = program_command(info, candidate, args[1:])
+  for fd in fds:
+    os.set_inheritable(fd, True)
+  env = child_env()
+  if os.environ.get("TERM"):
+    env["TERM"] = os.environ["TERM"]
+  try:
+    os.execve(program, argv, env)
+  except OSError as exc:
+    log(f"cannot start {candidate}: {exc.strerror}")
+    close_program(info)
+    return 126
 
 
 class CommandFailed(Exception):
   pass
 
 
-def capture(argv, timeout: float, max_out: int, max_err: int):
+def kill_process_group(proc) -> None:
+  try:
+    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+  except (ProcessLookupError, PermissionError):
+    proc.kill()
+
+
+def capture(argv, timeout: float, max_out: int, max_err: int, program: str = "", pass_fds=()):
   """Run argv with a deadline and byte caps and return (code, out, err).
 
-  The command stays in this process group, so the group kill of `run` also
-  reaches anything it leaves behind. Raises CommandFailed if it cannot start,
-  runs past the deadline or writes more than a cap.
+  The command gets its own process group, so a failure stops its children
+  too. With program set, that path starts instead of argv[0]: it is the
+  descriptor of a file that passed the checks. Raises CommandFailed if the
+  command cannot start, runs past the deadline or writes more than a cap.
   """
-  try:
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=child_env(), close_fds=True)
-  except OSError as exc:
-    raise CommandFailed(f"cannot start {os.path.basename(argv[0])}: {exc.strerror}")
   name = os.path.basename(argv[0])
+  try:
+    proc = subprocess.Popen(argv, executable=program or None, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env(),
+                            close_fds=True, pass_fds=tuple(pass_fds), start_new_session=True)
+  except OSError as exc:
+    raise CommandFailed(f"cannot start {name}: {exc.strerror}")
   out_fd = proc.stdout.fileno()
   err_fd = proc.stderr.fileno()
   out = bytearray()
@@ -607,7 +713,7 @@ def capture(argv, timeout: float, max_out: int, max_err: int):
     except subprocess.TimeoutExpired:
       raise CommandFailed(f"{name} ran longer than {timeout} s")
   except BaseException:
-    proc.kill()
+    kill_process_group(proc)
     proc.wait()
     raise
   finally:
@@ -805,8 +911,8 @@ def cmd_bridge(args) -> int:
     return 1
   usage_fd = None
   try:
-    cswap = find_user_binary(CSWAP_CANDIDATES)
-    if not cswap:
+    found = open_user_binary(CSWAP_CANDIDATES)
+    if not found:
       # Without claude-swap there are no account tabs. The panel shows how to install it.
       usage_fd = open_tree(USAGE_PARTS)
       if usage_fd is not None:
@@ -815,9 +921,12 @@ def cmd_bridge(args) -> int:
       write_status(status_fd, "missing")
       return 0
 
+    cswap, cswap_info = found
+    program, argv, fds = program_command(cswap_info, cswap, ["list", "--json"])
     data = None
     try:
-      code, out, err = capture([cswap, "list", "--json"], LIST_TIMEOUT, MAX_LIST_BYTES, MAX_SMALL_OUTPUT)
+      code, out, err = capture(argv, LIST_TIMEOUT, MAX_LIST_BYTES, MAX_SMALL_OUTPUT,
+                               program=program, pass_fds=fds)
       if code != 0:
         detail = last_lines(err, 1)
         message = f"cswap list failed: {detail or f'exit code {code}'}"
@@ -828,6 +937,8 @@ def cmd_bridge(args) -> int:
       message = f"cswap list failed: {exc}"
     except (ValueError, RecursionError) as exc:
       message = f"cswap list failed: {str(exc)[:200]}"
+    finally:
+      close_program(cswap_info)
     if message:
       # Keep the last tabs: a failed run is often temporary.
       log(message)
@@ -886,10 +997,59 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 CONTROL_RE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
 
+def markup_escape(text: str) -> str:
+  # A notification body can be read as markup, so & < > never go through raw.
+  return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def last_lines(data: bytes, count: int = 3) -> str:
   text = CONTROL_RE.sub("", ANSI_RE.sub("", data.decode("utf-8", "replace")))
   lines = [line.strip() for line in text.splitlines() if line.strip()]
-  return "\n".join(lines[-count:])[:300]
+  return markup_escape("\n".join(lines[-count:])[:300])
+
+
+def safe_label(value, fallback: str) -> str:
+  text = re.sub(r"[^A-Za-z0-9@._+ -]", "", str(value or ""))[:64].strip()
+  return markup_escape(text) if text else fallback
+
+
+def account_name(number: int, fallback: str) -> str:
+  """The tab name of this account, from the files that the bridge writes.
+
+  The name never comes from the command line. The files are read through the
+  same folder and file checks as the state reader.
+  """
+  try:
+    status_fd = open_tree(STATUS_PARTS)
+  except Unsafe:
+    status_fd = None
+  if status_fd is not None:
+    try:
+      active = parse_json(read_file(status_fd, "active.json", MAX_STATUS_BYTES) or b"null")
+      if isinstance(active, dict) and active.get("number") == number:
+        return safe_label(active.get("name"), fallback)
+    except (Unsafe, ValueError, RecursionError):
+      pass
+    finally:
+      os.close(status_fd)
+  try:
+    usage_fd = open_tree(USAGE_PARTS)
+  except Unsafe:
+    usage_fd = None
+  if usage_fd is not None:
+    try:
+      for name in sorted(list_names(usage_fd, [])):
+        if not ACCOUNT_FILE_RE.fullmatch(name):
+          continue
+        try:
+          record = parse_json(read_file(usage_fd, name, MAX_RECORD_BYTES) or b"null")
+        except (Unsafe, ValueError, RecursionError):
+          continue
+        if isinstance(record, dict) and record.get("cswapNumber") == number:
+          return safe_label(record.get("name"), fallback)
+    finally:
+      os.close(usage_fd)
+  return fallback
 
 
 def notify(urgency: str, summary: str, body: str) -> None:
@@ -901,21 +1061,26 @@ def notify(urgency: str, summary: str, body: str) -> None:
 
 
 def cmd_switch(args) -> int:
-  if len(args) != 2 or not re.fullmatch(r"[1-9][0-9]{0,2}", args[0]):
-    log("usage: cswap-panel switch NUMBER NAME")
+  if len(args) != 1 or not re.fullmatch(r"[1-9][0-9]{0,2}", args[0]):
+    log("usage: cswap-panel switch NUMBER")
     return 2
   number = args[0]
-  name = re.sub(r"[^A-Za-z0-9@._+ -]", "", args[1])[:64].strip() or f"account {number}"
+  name = account_name(int(number), f"account {number}")
 
-  cswap = find_user_binary(CSWAP_CANDIDATES)
-  if not cswap:
+  found = open_user_binary(CSWAP_CANDIDATES)
+  if not found:
     notify("critical", f"Could not switch to {name}", "claude-swap (cswap) is not installed.")
     return 1
+  cswap, info = found
+  program, argv, fds = program_command(info, cswap, ["switch", number])
   try:
-    code, out, err = capture([cswap, "switch", number], SWITCH_TIMEOUT, MAX_SMALL_OUTPUT, MAX_SMALL_OUTPUT)
+    code, out, err = capture(argv, SWITCH_TIMEOUT, MAX_SMALL_OUTPUT, MAX_SMALL_OUTPUT,
+                             program=program, pass_fds=fds)
     detail = last_lines(out + err)
   except CommandFailed as exc:
-    code, detail = 1, str(exc)
+    code, detail = 1, markup_escape(str(exc))
+  finally:
+    close_program(info)
 
   if code == 0:
     notify("normal", f"Claude Code now uses {name}", "Open sessions change on their next message.")
@@ -966,19 +1131,41 @@ def parse_run_args(args):
   return options["--timeout"], options["--max-out"], options["--max-err"], argv
 
 
+def parent_of(pid: str) -> int:
+  try:
+    with open(f"/proc/{pid}/stat") as handle:
+      return int(handle.read().rsplit(")", 1)[1].split()[1])
+  except (OSError, IndexError, ValueError):
+    return -1
+
+
 def child_pids(pid: int) -> list:
+  """The children of pid, from /proc. Without the children file of the
+  kernel, every process in /proc is read instead."""
   pids = []
+  tasks = []
   try:
     tasks = os.listdir(f"/proc/{pid}/task")
   except OSError:
     return pids
+  found_file = False
   for task in tasks:
     try:
       with open(f"/proc/{pid}/task/{task}/children") as handle:
+        found_file = True
         pids.extend(int(value) for value in handle.read().split())
     except (OSError, ValueError):
       pass
-  return pids
+  if found_file:
+    return pids
+  if not CHILDREN_FILE_REPORTED:
+    CHILDREN_FILE_REPORTED.append(True)
+    log("run: this kernel has no /proc/<pid>/task/<tid>/children; reading every process instead")
+  try:
+    entries = os.listdir("/proc")
+  except OSError:
+    return pids
+  return [int(entry) for entry in entries if entry.isdigit() and parent_of(entry) == pid]
 
 
 def is_zombie(pid: int) -> bool:
@@ -998,7 +1185,10 @@ def kill_descendants(signum=None, frame=None) -> None:
   it kills them one layer at a time, from the top down.
   """
   me = os.getpid()
-  for _ in range(1000):
+  # The runner waits KILL_GRACE seconds for the keeper, so the sweep must end
+  # well before that. Whatever is left goes with the group kill below.
+  end = time.monotonic() + SWEEP_SECONDS
+  while time.monotonic() < end:
     alive = [pid for pid in child_pids(me) if not is_zombie(pid)]
     if not alive:
       break
@@ -1078,6 +1268,14 @@ def cmd_run(args) -> int:
 
   env = child_env()
   prctl = ctypes.CDLL(None, use_errno=True).prctl
+  # If the shell dies, also from SIGKILL, the kernel sends SIGTERM here, and
+  # the handler below stops the whole group.
+  shell_pid = os.getppid()
+  zero = ctypes.c_ulong(0)
+  prctl(PR_SET_PDEATHSIG, ctypes.c_ulong(signal.SIGTERM), zero, zero, zero)
+  if os.getppid() != shell_pid:
+    log("run: the shell ended before the command started")
+    return EXIT_RUNNER
   out_r, out_w = os.pipe()
   err_r, err_w = os.pipe()
   status_r, status_w = os.pipe()
@@ -1244,12 +1442,13 @@ def cmd_run(args) -> int:
 # ------------------------------------------------------------------- main
 
 
-COMMANDS = {"run": cmd_run, "state": cmd_state, "bridge": cmd_bridge, "switch": cmd_switch, "resolve": cmd_resolve}
+COMMANDS = {"run": cmd_run, "state": cmd_state, "bridge": cmd_bridge, "switch": cmd_switch,
+            "resolve": cmd_resolve, "exec": cmd_exec}
 
 
 def main(argv) -> int:
   if not argv or argv[0] not in COMMANDS:
-    log("usage: cswap-panel run|state|bridge|switch|resolve ...")
+    log("usage: cswap-panel run|state|bridge|switch|resolve|exec ...")
     return 2
   return COMMANDS[argv[0]](argv[1:])
 

@@ -87,7 +87,8 @@ Item {
     panelScript: root.panelScript
     environment: root.closedEnv
     timeoutSec: 15
-    maxOut: 4194304
+    // The reader writes at most 2 MiB of records and 128 KiB of status.
+    maxOut: 2621440
     maxErr: 65536
     onDone: (ok, exitCode, output) => {
       // A failed read keeps the last good state.
@@ -132,6 +133,8 @@ Item {
   FileView {
     path: root.home !== "" ? root.home + "/.local/state/cswap-omarchy/status.json" : ""
     preload: false
+    blockLoading: true
+    blockAllReads: true
     watchChanges: true
     printErrors: false
     onFileChanged: root.readState()
