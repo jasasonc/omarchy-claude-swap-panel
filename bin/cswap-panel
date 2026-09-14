@@ -64,7 +64,6 @@ CSWAP_CANDIDATES = (
 CLAUDE_CANDIDATES = (
   os.path.join(HOME_DIR, ".local/share/mise/installs/claude/latest/claude"),
   os.path.join(HOME_DIR, ".local/bin/claude"),
-  os.path.join(HOME_DIR, ".local/share/mise/shims/claude"),
   os.path.join(HOME_DIR, ".claude/local/claude"),
 )
 MAX_HOPS = 8

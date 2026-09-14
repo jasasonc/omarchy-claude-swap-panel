@@ -29,7 +29,7 @@ The plugin is a copy of the Omarchy Agents panel (`omarchy.agents`) with these c
   uv tool install claude-swap
   ```
 
-  The plugin looks for `cswap` only in `~/.local/bin` and in `~/.local/share/uv/tools/claude-swap/bin`. The Add account terminal looks for `claude` only in `~/.local/share/mise/installs/claude/latest`, `~/.local/bin`, `~/.local/share/mise/shims` and `~/.claude/local`.
+  The plugin looks for `cswap` only in `~/.local/bin` and in `~/.local/share/uv/tools/claude-swap/bin`. The Add account terminal looks for `claude` only in `~/.local/share/mise/installs/claude/latest`, `~/.local/bin` and `~/.claude/local`.
 - Python 3 at `/usr/bin/python3`.
 
 ## Install
