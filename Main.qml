@@ -261,8 +261,9 @@ Item {
   }
 
   // This plugin shows Claude accounts and Fireworks. The dispatcher skips an
-  // excluded collector before it starts it, so the Codex collector never runs.
-  readonly property var excludedAgents: ["codex"]
+  // excluded collector before it starts it, so those collectors never run, and
+  // providerEnabled() hides any already-collected record for them.
+  readonly property var excludedAgents: ["codex", "opencode"]
 
   function updateAgent(id) {
     return validId(id) && excludedAgents.indexOf(String(id)) < 0
@@ -337,6 +338,7 @@ Item {
   }
 
   function providerEnabled(id) {
+    if (excludedAgents.indexOf(String(id)) >= 0) return false
     if (!settings || !settings.providers || !settings.providers[id]) return true
     return settings.providers[id].enabled !== false
   }
