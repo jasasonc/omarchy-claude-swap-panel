@@ -630,16 +630,18 @@ Panel {
           }
 
           // ---------- Provider switch ----------
-          Row {
+          Grid {
             id: providerSwitch
             visible: root.providers.length > 1
             // A 1 px inset keeps the outer tab borders inside the clip.
             x: 1
             width: parent.width - 2
             spacing: Style.spacing.md
+            // Past three tabs, split them over two rows so names stay readable.
+            columns: root.providers.length > 3 ? Math.ceil(root.providers.length / 2) : Math.max(1, root.providers.length)
 
             readonly property real cellWidth: root.providers.length > 0
-              ? (width - spacing * (root.providers.length - 1)) / root.providers.length
+              ? (width - spacing * (columns - 1)) / columns
               : 0
 
             Repeater {
