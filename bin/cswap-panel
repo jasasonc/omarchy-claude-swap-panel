@@ -55,7 +55,6 @@ ACCOUNT_FILE_RE = re.compile(r"cswap-[a-z0-9][a-z0-9-]{0,79}\.json")
 ENV_KEYS = ("OMARCHY_PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "CLAUDE_CONFIG_DIR")
 SYSTEM_PATH = "/usr/bin:/bin"
 
-USAGE_UPDATE = "/usr/bin/omarchy-agent-usage-update"
 NOTIFY_SEND = "/usr/bin/notify-send"
 
 # User tools live in the user's home. Only these fixed paths are tried, in
@@ -93,7 +92,6 @@ MAX_LIST_BYTES = 4 * 1024 * 1024
 MAX_ACCOUNTS = 32
 SWITCH_TIMEOUT = 60
 NOTIFY_TIMEOUT = 10
-UPDATE_TIMEOUT = 90
 MAX_SMALL_OUTPUT = 64 * 1024
 
 # Exit codes of `run` that a target cannot be mistaken for.
@@ -1087,14 +1085,8 @@ def cmd_switch(args) -> int:
   else:
     notify("critical", f"Could not switch to {name}", detail)
 
-  # Omarchy's own collector writes the record of the active account.
-  try:
-    update_code, _, update_err = capture([USAGE_UPDATE, "--force", "claude"], UPDATE_TIMEOUT,
-                                         MAX_SMALL_OUTPUT, MAX_SMALL_OUTPUT)
-    if update_code != 0:
-      log(f"usage update failed: {last_lines(update_err)}")
-  except CommandFailed as exc:
-    log(str(exc))
+  # The panel refreshes the usage record itself once this returns, so the
+  # switch does not wait for the collectors.
   return 0 if code == 0 else 1
 
 

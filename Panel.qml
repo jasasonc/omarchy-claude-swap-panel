@@ -133,8 +133,12 @@ Panel {
     onDone: (ok, exitCode, output) => {
       root.switchRunning = false
       usage.runCswapBridge()
-      // The account you switched to is now the active Claude Code tab.
-      if (ok) root.selectedProviderId = "claude"
+      // The account you switched to is now the active Claude Code tab. Fresh
+      // limits for it come from a limits-only collector run (under a second).
+      if (ok) {
+        root.selectedProviderId = "claude"
+        usage.runUpdate("limits", ["claude"])
+      }
     }
   }
 
